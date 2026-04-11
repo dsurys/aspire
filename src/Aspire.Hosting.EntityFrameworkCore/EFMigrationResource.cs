@@ -62,6 +62,11 @@ public class EFMigrationResource(string name, ProjectResource projectResource, s
     public bool BundleSelfContained { get; set; }
 
     /// <summary>
+    /// Gets or sets whether the migration bundle should be applied automatically during the deploy pipeline step.
+    /// </summary>
+    public bool BundleApplyOnDeploy { get; set; }
+
+    /// <summary>
     /// Gets or sets the output directory for new migrations. Used by the Add Migration command.
     /// </summary>
     /// <remarks>

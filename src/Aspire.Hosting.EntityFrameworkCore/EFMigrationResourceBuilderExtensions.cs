@@ -19,8 +19,9 @@ public static class EFMigrationResourceBuilderExtensions
     /// <returns>The resource builder for chaining.</returns>
     /// <remarks>
     /// <para>
-    /// When enabled, migrations will be applied during AppHost startup. The resource state will transition
-    /// from "Pending" to "Running" to "Finished" (or "FailedToStart" on error).
+    /// When enabled, migrations will be applied during AppHost startup.
+    /// This only affects local run-mode execution. The migrations resource is not deployed with the app,
+    /// so the command has no effect during publish or deployment.
     /// </para>
     /// <para>
     /// A health check is automatically registered for this resource, allowing other resources to use
@@ -46,6 +47,9 @@ public static class EFMigrationResourceBuilderExtensions
         EFMigrationResource migrationResource,
         CancellationToken cancellationToken)
     {
+        var resourceLoggerService = serviceProvider.GetRequiredService<ResourceLoggerService>();
+        var logger = resourceLoggerService.GetLogger(migrationResource);
+
         try
         {
             var resourceCommandService = serviceProvider.GetRequiredService<ResourceCommandService>();
@@ -53,6 +57,14 @@ public static class EFMigrationResourceBuilderExtensions
                 migrationResource,
                 "ef-database-update",
                 cancellationToken).ConfigureAwait(false);
+
+            if (!result.Success && !result.Canceled)
+            {
+                logger.LogError(
+                    "EF Core database update on startup failed for resource '{ResourceName}'. {ErrorMessage}",
+                    migrationResource.Name,
+                    result.Message ?? "");
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -60,8 +72,6 @@ public static class EFMigrationResourceBuilderExtensions
         }
         catch (Exception ex)
         {
-            var resourceLoggerService = serviceProvider.GetRequiredService<ResourceLoggerService>();
-            var logger = resourceLoggerService.GetLogger(migrationResource);
             logger.LogError(ex, "EF Core database update on startup failed for resource '{ResourceName}'.", migrationResource.Name);
         }
     }
@@ -73,6 +83,11 @@ public static class EFMigrationResourceBuilderExtensions
     /// <param name="idempotent">If <c>true</c>, generates an idempotent script with IF NOT EXISTS checks.</param>
     /// <param name="noTransactions">If <c>true</c>, omits transaction statements from the script.</param>
     /// <returns>The resource builder for chaining.</returns>
+    /// <remarks>
+    /// During <c>aspire publish</c>, the generated SQL script is written to the publish output directory under
+    /// the <c>efmigrations</c> folder. The script is included as a deployment artifact, but it is not executed
+    /// automatically during deployment.
+    /// </remarks>
     [AspireExport]
     public static IResourceBuilder<EFMigrationResource> PublishAsMigrationScript(this IResourceBuilder<EFMigrationResource> builder, bool idempotent = false, bool noTransactions = false)
     {
@@ -88,13 +103,21 @@ public static class EFMigrationResourceBuilderExtensions
     /// <param name="builder">The resource builder.</param>
     /// <param name="targetRuntime">The target runtime identifier for the bundle (e.g., "linux-x64", "win-x64"). If null, uses the current runtime.</param>
     /// <param name="selfContained">If <c>true</c>, creates a self-contained bundle that includes the .NET runtime.</param>
+    /// <param name="applyOnDeploy">If <c>true</c>, the bundle is executed automatically during the deploy pipeline step.</param>
     /// <returns>The resource builder for chaining.</returns>
+    /// <remarks>
+    /// During <c>aspire publish</c>, the bundle executable is written to the publish output directory under the
+    /// <c>efmigrations</c> folder. When <paramref name="applyOnDeploy"/> is <c>true</c>, Aspire runs the generated
+    /// bundle as part of the deploy pipeline after the other resources have been deployed and are running,
+    /// passing the resolved connection string from the resource this is waiting for.
+    /// </remarks>
     [AspireExport]
-    public static IResourceBuilder<EFMigrationResource> PublishAsMigrationBundle(this IResourceBuilder<EFMigrationResource> builder, string? targetRuntime = null, bool selfContained = false)
+    public static IResourceBuilder<EFMigrationResource> PublishAsMigrationBundle(this IResourceBuilder<EFMigrationResource> builder, string? targetRuntime = null, bool selfContained = false, bool applyOnDeploy = false)
     {
         builder.Resource.PublishAsMigrationBundle = true;
         builder.Resource.BundleTargetRuntime = targetRuntime;
         builder.Resource.BundleSelfContained = selfContained;
+        builder.Resource.BundleApplyOnDeploy = applyOnDeploy;
         return builder;
     }
 

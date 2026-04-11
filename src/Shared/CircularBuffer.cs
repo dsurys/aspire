@@ -199,7 +199,6 @@ internal sealed class CircularBuffer<T> : IList<T>, ICollection<T>, IEnumerable<
             Increment(ref _end);
             _start = _end;
 
-            Debug.Assert(!_buffer.Contains(removedItem), "Item was not correctly removed.");
             ItemRemovedForCapacity?.Invoke(removedItem);
         }
         else
