@@ -473,6 +473,97 @@ internal static class CliE2EAutomatorHelpers
         await auto.RunCommandFailFastAsync(command, counter, TimeSpan.FromSeconds(300));
     }
 
+    /// <summary>
+    /// Runs <c>aspire run</c>, captures its transcript in the workspace, and waits for the AppHost to be ready.
+    /// </summary>
+    internal static async Task AspireRunUntilReadyAsync(
+        this Hex1bTerminalAutomator auto,
+        TemporaryWorkspace workspace,
+        TimeSpan? timeout = null)
+    {
+        var effectiveTimeout = timeout ?? TimeSpan.FromMinutes(5);
+        var hostOutputPath = CliE2ETestHelpers.GetWorkspaceFilePath(workspace, "_aspire-run.log");
+        var containerOutputPath = CliE2ETestHelpers.ToContainerPath(hostOutputPath, workspace);
+
+        CliE2ETestHelpers.RegisterCaptureFile("_aspire-run.log", hostOutputPath);
+
+        await auto.TypeAsync(
+            "(set -o pipefail; aspire run 2>&1 | tee " +
+            QuoteBashArg(containerOutputPath) +
+            "; s=${PIPESTATUS[0]}; if [ \"$s\" -eq 130 ]; then exit 0; fi; exit \"$s\")");
+        await auto.EnterAsync();
+
+        await auto.WaitUntilAsync(s =>
+        {
+            if (s.ContainsText("Select an AppHost to use:"))
+            {
+                throw new InvalidOperationException(
+                    "Unexpected apphost selection prompt detected! " +
+                    "This indicates multiple apphosts were incorrectly detected.");
+            }
+
+            return s.ContainsText("Press CTRL+C to stop the AppHost and exit.")
+                || s.ContainsText("Press CTRL+C to stop the apphost and exit.");
+        }, timeout: effectiveTimeout, description: "Press CTRL+C message (aspire run started)");
+    }
+
+    /// <summary>
+    /// Copies the latest <c>aspire start --format json</c> transcript into the mounted workspace.
+    /// </summary>
+    internal static async Task PersistAspireStartJsonAsync(
+        this Hex1bTerminalAutomator auto,
+        TemporaryWorkspace workspace,
+        SequenceCounter counter)
+    {
+        var hostOutputPath = CliE2ETestHelpers.GetWorkspaceFilePath(workspace, "_aspire-start.json");
+        var containerOutputPath = CliE2ETestHelpers.ToContainerPath(hostOutputPath, workspace);
+
+        CliE2ETestHelpers.RegisterCaptureFile("_aspire-start.json", hostOutputPath);
+
+        await auto.RunCommandAsync(
+            $"if [ -f {QuoteBashArg(AspireStartJsonFile)} ]; then cp {QuoteBashArg(AspireStartJsonFile)} {QuoteBashArg(containerOutputPath)}; fi",
+            counter);
+    }
+
+    /// <summary>
+    /// Runs a JSON-producing CLI command and writes stdout to a workspace file for host-side assertions.
+    /// </summary>
+    internal static async Task<string> CaptureJsonOutputAsync(
+        this Hex1bTerminalAutomator auto,
+        string command,
+        TemporaryWorkspace workspace,
+        SequenceCounter counter,
+        string outputFileName)
+    {
+        var hostOutputPath = CliE2ETestHelpers.GetWorkspaceFilePath(workspace, outputFileName);
+        var containerOutputPath = CliE2ETestHelpers.ToContainerPath(hostOutputPath, workspace);
+
+        CliE2ETestHelpers.RegisterCaptureFile(outputFileName, hostOutputPath);
+
+        await auto.RunCommandAsync($"{command} > {QuoteBashArg(containerOutputPath)}", counter);
+        return hostOutputPath;
+    }
+
+    /// <summary>
+    /// Verifies a URL responds with HTTP 200 from inside the CLI test environment.
+    /// </summary>
+    internal static async Task AssertUrlRespondsAsync(
+        this Hex1bTerminalAutomator auto,
+        string url,
+        string label,
+        SequenceCounter counter,
+        TimeSpan? timeout = null)
+    {
+        var successMarker = $"{label}-http-200";
+
+        await auto.TypeAsync(
+            $"curl -ksSL -o /dev/null -w '{successMarker}' {QuoteBashArg(url)} " +
+            $"|| echo '{label}-http-failed'");
+        await auto.EnterAsync();
+        await auto.WaitUntilTextAsync(successMarker, timeout: timeout ?? TimeSpan.FromSeconds(30));
+        await auto.WaitForSuccessPromptAsync(counter);
+    }
+
     private static async Task ExtractLocalHiveArchiveAsync(
         this Hex1bTerminalAutomator auto,
         string archivePath,
