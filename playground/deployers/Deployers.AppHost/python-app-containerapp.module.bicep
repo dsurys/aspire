@@ -18,7 +18,7 @@ param aca_env_outputs_azure_container_registry_endpoint string
 
 param aca_env_outputs_azure_container_registry_managed_identity_id string
 
-resource python_app 'Microsoft.App/containerApps@2025-01-01' = {
+resource python_app 'Microsoft.App/containerApps@2025-07-01' = {
   name: 'python-app'
   location: location
   properties: {

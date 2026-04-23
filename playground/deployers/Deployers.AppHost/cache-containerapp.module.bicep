@@ -8,7 +8,7 @@ param aca_env_outputs_azure_container_apps_environment_id string
 @secure()
 param cache_password_value string
 
-resource cache 'Microsoft.App/containerApps@2025-01-01' = {
+resource cache 'Microsoft.App/containerApps@2025-07-01' = {
   name: 'cache'
   location: location
   properties: {

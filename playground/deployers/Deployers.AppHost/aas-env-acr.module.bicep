@@ -15,3 +15,5 @@ resource aas_env_acr 'Microsoft.ContainerRegistry/registries@2025-04-01' = {
 output name string = aas_env_acr.name
 
 output loginServer string = aas_env_acr.properties.loginServer
+
+output id string = aas_env_acr.id

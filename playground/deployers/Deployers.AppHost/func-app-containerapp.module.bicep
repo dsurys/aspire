@@ -33,7 +33,7 @@ param aca_env_outputs_azure_container_registry_endpoint string
 
 param aca_env_outputs_azure_container_registry_managed_identity_id string
 
-resource func_app 'Microsoft.App/containerApps@2025-02-02-preview' = {
+resource func_app 'Microsoft.App/containerApps@2025-10-02-preview' = {
   name: 'func-app'
   location: location
   properties: {
