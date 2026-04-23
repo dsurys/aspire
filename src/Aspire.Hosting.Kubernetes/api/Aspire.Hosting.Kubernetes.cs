@@ -8,18 +8,46 @@
 //------------------------------------------------------------------------------
 namespace Aspire.Hosting
 {
+    public static partial class KubernetesAspireDashboardResourceBuilderExtensions
+    {
+        [AspireExport(Description = "Enables or disables forwarded headers support for the Aspire dashboard")]
+        public static ApplicationModel.IResourceBuilder<Kubernetes.KubernetesAspireDashboardResource> WithForwardedHeaders(this ApplicationModel.IResourceBuilder<Kubernetes.KubernetesAspireDashboardResource> builder, bool enabled = true) { throw null; }
+
+        [AspireExport(Description = "Sets the Kubernetes Service ports for the OTLP endpoints")]
+        public static ApplicationModel.IResourceBuilder<Kubernetes.KubernetesAspireDashboardResource> WithOtlpServicePort(this ApplicationModel.IResourceBuilder<Kubernetes.KubernetesAspireDashboardResource> builder, int? grpcPort = null, int? httpPort = null) { throw null; }
+
+        [AspireExport(Description = "Sets the Kubernetes Service port for the Aspire dashboard")]
+        public static ApplicationModel.IResourceBuilder<Kubernetes.KubernetesAspireDashboardResource> WithServicePort(this ApplicationModel.IResourceBuilder<Kubernetes.KubernetesAspireDashboardResource> builder, int? port = null) { throw null; }
+    }
+
     public static partial class KubernetesEnvironmentExtensions
     {
-        [AspireExport("addKubernetesEnvironment", Description = "Adds a Kubernetes publishing environment")]
+        [AspireExport(Description = "Adds a Kubernetes publishing environment")]
         public static ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> AddKubernetesEnvironment(this IDistributedApplicationBuilder builder, string name) { throw null; }
 
-        [AspireExport("withProperties", Description = "Configures properties of a Kubernetes environment", RunSyncOnBackgroundThread = true)]
+        [AspireExport(Description = "Adds a named node pool to a Kubernetes environment")]
+        public static ApplicationModel.IResourceBuilder<Kubernetes.KubernetesNodePoolResource> AddNodePool(this ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> builder, string name) { throw null; }
+
+        [AspireExport("configureDashboard", MethodName = "configureDashboard", Description = "Configures the Aspire dashboard resource for the Kubernetes environment", RunSyncOnBackgroundThread = true)]
+        public static ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> WithDashboard(this ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> builder, System.Action<ApplicationModel.IResourceBuilder<Kubernetes.KubernetesAspireDashboardResource>> configure) { throw null; }
+
+        [AspireExport(Description = "Enables or disables the Aspire dashboard for the Kubernetes environment")]
+        public static ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> WithDashboard(this ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> builder, bool enabled = true) { throw null; }
+
+        [AspireExport(Description = "Configures Helm chart deployment settings", RunSyncOnBackgroundThread = true)]
+        public static ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> WithHelm(this ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> builder, System.Action<Kubernetes.HelmChartOptions>? configure = null) { throw null; }
+
+        [AspireExport("withKubernetesNodePool", Description = "Schedules a workload on a specific Kubernetes node pool")]
+        public static ApplicationModel.IResourceBuilder<T> WithNodePool<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<Kubernetes.KubernetesNodePoolResource> nodePool)
+            where T : ApplicationModel.IResource { throw null; }
+
+        [AspireExport(Description = "Configures properties of a Kubernetes environment", RunSyncOnBackgroundThread = true)]
         public static ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> WithProperties(this ApplicationModel.IResourceBuilder<Kubernetes.KubernetesEnvironmentResource> builder, System.Action<Kubernetes.KubernetesEnvironmentResource> configure) { throw null; }
     }
 
     public static partial class KubernetesServiceExtensions
     {
-        [AspireExport("publishAsKubernetesService", Description = "Publishes the resource as a Kubernetes service")]
+        [AspireExport(Description = "Publishes the resource as a Kubernetes service")]
         public static ApplicationModel.IResourceBuilder<T> PublishAsKubernetesService<T>(this ApplicationModel.IResourceBuilder<T> builder, System.Action<Kubernetes.KubernetesResource> configure)
             where T : ApplicationModel.IComputeResource { throw null; }
     }
@@ -27,10 +55,54 @@ namespace Aspire.Hosting
 
 namespace Aspire.Hosting.Kubernetes
 {
+    [AspireExport(ExposeMethods = true)]
+    public sealed partial class HelmChartOptions
+    {
+        internal HelmChartOptions() { }
+
+        public HelmChartOptions WithChartVersion(ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> version) { throw null; }
+
+        public HelmChartOptions WithChartVersion(string version) { throw null; }
+
+        public HelmChartOptions WithNamespace(ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> @namespace) { throw null; }
+
+        public HelmChartOptions WithNamespace(string @namespace) { throw null; }
+
+        public HelmChartOptions WithReleaseName(ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> releaseName) { throw null; }
+
+        public HelmChartOptions WithReleaseName(string releaseName) { throw null; }
+    }
+
+    public sealed partial class HelmChartVersionAnnotation : ApplicationModel.IResourceAnnotation
+    {
+        public HelmChartVersionAnnotation(ApplicationModel.ReferenceExpression version) { }
+
+        public ApplicationModel.ReferenceExpression Version { get { throw null; } }
+    }
+
+    public sealed partial class HelmReleaseNameAnnotation : ApplicationModel.IResourceAnnotation
+    {
+        public HelmReleaseNameAnnotation(ApplicationModel.ReferenceExpression releaseName) { }
+
+        public ApplicationModel.ReferenceExpression ReleaseName { get { throw null; } }
+    }
+
+    [AspireExport(ExposeProperties = true)]
+    public partial class KubernetesAspireDashboardResource : ApplicationModel.ContainerResource
+    {
+        public KubernetesAspireDashboardResource(string name) : base(default!, default) { }
+
+        public ApplicationModel.EndpointReference OtlpGrpcEndpoint { get { throw null; } }
+
+        public ApplicationModel.EndpointReference PrimaryEndpoint { get { throw null; } }
+    }
+
     [AspireExport(ExposeProperties = true)]
     public sealed partial class KubernetesEnvironmentResource : ApplicationModel.Resource, ApplicationModel.IComputeEnvironmentResource, ApplicationModel.IResource
     {
         public KubernetesEnvironmentResource(string name) : base(default!) { }
+
+        public bool DashboardEnabled { get { throw null; } set { } }
 
         public string DefaultImagePullPolicy { get { throw null; } set { } }
 
@@ -50,8 +122,29 @@ namespace Aspire.Hosting.Kubernetes
 
         public string HelmChartVersion { get { throw null; } set { } }
 
+        public string? KubeConfigPath { get { throw null; } set { } }
+
+        public ApplicationModel.IComputeEnvironmentResource? OwningComputeEnvironment { get { throw null; } set { } }
+
         [System.Diagnostics.CodeAnalysis.Experimental("ASPIRECOMPUTE002", UrlFormat = "https://aka.ms/aspire/diagnostics/{0}")]
         public ApplicationModel.ReferenceExpression GetHostAddressExpression(ApplicationModel.EndpointReference endpointReference) { throw null; }
+    }
+
+    public sealed partial class KubernetesNamespaceAnnotation : ApplicationModel.IResourceAnnotation
+    {
+        public KubernetesNamespaceAnnotation(ApplicationModel.ReferenceExpression @namespace) { }
+
+        public ApplicationModel.ReferenceExpression Namespace { get { throw null; } }
+    }
+
+    [AspireExport]
+    public partial class KubernetesNodePoolResource : ApplicationModel.Resource, ApplicationModel.IResourceWithParent<KubernetesEnvironmentResource>, ApplicationModel.IResourceWithParent, ApplicationModel.IResource
+    {
+        public KubernetesNodePoolResource(string name, KubernetesEnvironmentResource environment) : base(default!) { }
+
+        public string NodeSelectorLabelKey { get { throw null; } init { } }
+
+        public KubernetesEnvironmentResource Parent { get { throw null; } }
     }
 
     [AspireExport(ExposeProperties = true)]
@@ -1947,7 +2040,7 @@ namespace Aspire.Hosting.Kubernetes.Resources
     public sealed partial class RollingUpdateStatefulSetStrategyV1
     {
         [YamlDotNet.Serialization.YamlMember(Alias = "maxUnavailable")]
-        public int MaxUnavailable { get { throw null; } set { } }
+        public int? MaxUnavailable { get { throw null; } set { } }
 
         [YamlDotNet.Serialization.YamlMember(Alias = "partition")]
         public int? Partition { get { throw null; } set { } }
@@ -2083,6 +2176,12 @@ namespace Aspire.Hosting.Kubernetes.Resources
 
         [YamlDotNet.Serialization.YamlMember(Alias = "spec")]
         public ServiceSpecV1 Spec { get { throw null; } set { } }
+    }
+
+    [YamlDotNet.Serialization.YamlSerializable]
+    public sealed partial class ServiceAccountV1 : BaseKubernetesResource
+    {
+        public ServiceAccountV1() : base(default!, default!) { }
     }
 
     [YamlDotNet.Serialization.YamlSerializable]

@@ -47,7 +47,11 @@ namespace Aspire.TypeSystem
 
         public System.Collections.Generic.IReadOnlyList<AtsTypeRef> ExpandedTargetTypes { get { throw null; } set { } }
 
+        public bool IsObsolete { get { throw null; } init { } }
+
         public required string MethodName { get { throw null; } set { } }
+
+        public string? ObsoleteMessage { get { throw null; } init { } }
 
         public string? OwningTypeName { get { throw null; } init { } }
 
@@ -268,11 +272,15 @@ namespace Aspire.TypeSystem
 
     public sealed partial class AtsTypeRef
     {
+        public AtsTypeRef? BaseType { get { throw null; } init { } }
+
         public AtsTypeCategory Category { get { throw null; } set { } }
 
         public System.Type? ClrType { get { throw null; } init { } }
 
         public AtsTypeRef? ElementType { get { throw null; } init { } }
+
+        public System.Collections.Generic.IReadOnlyList<AtsTypeRef> ImplementedInterfaces { get { throw null; } init { } }
 
         public bool IsDistributedApplication { get { throw null; } }
 
@@ -306,6 +314,12 @@ namespace Aspire.TypeSystem
         public static AspireUnionData? GetAspireUnionData(System.Reflection.ParameterInfo parameter) { throw null; }
 
         public static AspireUnionData? GetAspireUnionData(System.Reflection.PropertyInfo property) { throw null; }
+
+        public static ObsoleteData? GetObsoleteData(System.Reflection.MethodInfo method) { throw null; }
+
+        public static ObsoleteData? GetObsoleteData(System.Reflection.PropertyInfo property) { throw null; }
+
+        public static ObsoleteData? GetObsoleteData(System.Type type) { throw null; }
 
         public static bool HasAspireDtoData(System.Type type) { throw null; }
 
@@ -380,6 +394,13 @@ namespace Aspire.TypeSystem
         System.Collections.Generic.Dictionary<string, string> Scaffold(ScaffoldRequest request);
     }
 
+    public sealed partial class ObsoleteData
+    {
+        public bool IsError { get { throw null; } init { } }
+
+        public string? Message { get { throw null; } init { } }
+    }
+
     public sealed partial class RuntimeSpec
     {
         public required string CodeGenLanguage { get { throw null; } init { } }
@@ -391,6 +412,8 @@ namespace Aspire.TypeSystem
         public required CommandSpec Execute { get { throw null; } init { } }
 
         public string? ExtensionLaunchCapability { get { throw null; } init { } }
+
+        public CommandSpec[]? Initialize { get { throw null; } init { } }
 
         public CommandSpec? InstallDependencies { get { throw null; } init { } }
 

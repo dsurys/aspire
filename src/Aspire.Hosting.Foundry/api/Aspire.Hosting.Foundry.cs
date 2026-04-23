@@ -43,22 +43,22 @@ namespace Aspire.Hosting
         [AspireExport("addModelDeploymentFromModel", Description = "Adds a model deployment to the parent Microsoft Foundry resource by using a model descriptor.")]
         public static ApplicationModel.IResourceBuilder<Foundry.FoundryDeploymentResource> AddModelDeployment(this ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> builder, string name, Foundry.FoundryModel model) { throw null; }
 
-        [AspireExport("addModelDeployment", Description = "Adds a model deployment to the parent Microsoft Foundry resource.")]
+        [AspireExport(Description = "Adds a model deployment to the parent Microsoft Foundry resource.")]
         public static ApplicationModel.IResourceBuilder<Foundry.FoundryDeploymentResource> AddModelDeployment(this ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> builder, string name, string modelName, string modelVersion, string format) { throw null; }
 
-        [AspireExport("addProject", Description = "Adds a Microsoft Foundry project resource to a Microsoft Foundry resource.")]
+        [AspireExport(Description = "Adds a Microsoft Foundry project resource to a Microsoft Foundry resource.")]
         public static ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> AddProject(this ApplicationModel.IResourceBuilder<Foundry.FoundryResource> builder, string name) { throw null; }
 
-        [AspireExport("withAppInsights", Description = "Associates an Azure Application Insights resource with a Microsoft Foundry project.")]
+        [AspireExport(Description = "Associates an Azure Application Insights resource with a Microsoft Foundry project.")]
         public static ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> WithAppInsights(this ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> builder, ApplicationModel.IResourceBuilder<Azure.AzureApplicationInsightsResource> appInsights) { throw null; }
 
         [AspireExportIgnore(Reason = "IContainerRegistry is not ATS-compatible. Use the resource-builder overload instead.")]
         public static ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> WithContainerRegistry(this ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> builder, ApplicationModel.IContainerRegistry registry) { throw null; }
 
-        [AspireExport("withContainerRegistry", Description = "Associates a container registry with a Microsoft Foundry project resource.")]
+        [AspireExport(Description = "Associates a container registry with a Microsoft Foundry project resource.")]
         public static ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> WithContainerRegistry(this ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> builder, ApplicationModel.IResourceBuilder<Azure.AzureContainerRegistryResource> registryBuilder) { throw null; }
 
-        [AspireExport("withKeyVault", Description = "Associates an Azure Key Vault resource with a Microsoft Foundry project.")]
+        [AspireExport(Description = "Associates an Azure Key Vault resource with a Microsoft Foundry project.")]
         public static ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> WithKeyVault(this ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> builder, ApplicationModel.IResourceBuilder<Azure.AzureKeyVaultResource> keyVault) { throw null; }
 
         [AspireExportIgnore(Reason = "The standard WithReference export already covers this polyglot scenario.")]
@@ -71,13 +71,13 @@ namespace Aspire.Hosting
         [AspireExport("addDeploymentFromModel", Description = "Adds a Microsoft Foundry deployment resource by using a Microsoft Foundry model descriptor.")]
         public static ApplicationModel.IResourceBuilder<Foundry.FoundryDeploymentResource> AddDeployment(this ApplicationModel.IResourceBuilder<Foundry.FoundryResource> builder, string name, Foundry.FoundryModel model) { throw null; }
 
-        [AspireExport("addDeployment", Description = "Adds a Microsoft Foundry deployment resource to a Microsoft Foundry resource.")]
+        [AspireExport(Description = "Adds a Microsoft Foundry deployment resource to a Microsoft Foundry resource.")]
         public static ApplicationModel.IResourceBuilder<Foundry.FoundryDeploymentResource> AddDeployment(this ApplicationModel.IResourceBuilder<Foundry.FoundryResource> builder, string name, string modelName, string modelVersion, string format) { throw null; }
 
-        [AspireExport("addFoundry", Description = "Adds a Microsoft Foundry resource to the distributed application model.")]
+        [AspireExport(Description = "Adds a Microsoft Foundry resource to the distributed application model.")]
         public static ApplicationModel.IResourceBuilder<Foundry.FoundryResource> AddFoundry(this IDistributedApplicationBuilder builder, string name) { throw null; }
 
-        [AspireExport("runAsFoundryLocal", Description = "Configures the Microsoft Foundry resource to run by using Foundry Local.")]
+        [AspireExport(Description = "Configures the Microsoft Foundry resource to run by using Foundry Local.")]
         public static ApplicationModel.IResourceBuilder<Foundry.FoundryResource> RunAsFoundryLocal(this ApplicationModel.IResourceBuilder<Foundry.FoundryResource> builder) { throw null; }
 
         [AspireExport("withFoundryDeploymentProperties", MethodName = "withProperties", Description = "Configures properties of a Microsoft Foundry deployment resource.", RunSyncOnBackgroundThread = true)]
@@ -90,9 +90,6 @@ namespace Aspire.Hosting
 
     public static partial class HostedAgentResourceBuilderExtensions
     {
-        [AspireExport("addAndPublishPromptAgent", Description = "Adds and publishes a prompt agent to a Microsoft Foundry project.")]
-        public static ApplicationModel.IResourceBuilder<Foundry.AzurePromptAgentResource> AddAndPublishPromptAgent(this ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource> project, ApplicationModel.IResourceBuilder<Foundry.FoundryDeploymentResource> model, string name, string? instructions) { throw null; }
-
         [AspireExportIgnore(Reason = "RunAsHostedAgent is not yet implemented, so AsHostedAgent is not available in polyglot hosts.")]
         public static ApplicationModel.IResourceBuilder<T> AsHostedAgent<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource>? project = null, System.Action<Foundry.HostedAgentConfiguration>? configure = null)
             where T : ApplicationModel.ExecutableResource { throw null; }
@@ -103,11 +100,11 @@ namespace Aspire.Hosting
 
         [AspireExport("publishAsHostedAgentExecutable", MethodName = "publishAsHostedAgent", Description = "Publishes an executable resource as a hosted agent in Microsoft Foundry.")]
         public static ApplicationModel.IResourceBuilder<T> PublishAsHostedAgent<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource>? project = null, System.Action<Foundry.HostedAgentConfiguration>? configure = null)
-            where T : ApplicationModel.ExecutableResource { throw null; }
+            where T : ApplicationModel.IResourceWithEndpoints, ApplicationModel.IResourceWithEnvironment, ApplicationModel.IComputeResource { throw null; }
 
         [AspireExportIgnore(Reason = "Subset of the full PublishAsHostedAgent overload which is exported.")]
         public static ApplicationModel.IResourceBuilder<T> PublishAsHostedAgent<T>(this ApplicationModel.IResourceBuilder<T> builder, System.Action<Foundry.HostedAgentConfiguration> configure)
-            where T : ApplicationModel.ExecutableResource { throw null; }
+            where T : ApplicationModel.IResourceWithEndpoints, ApplicationModel.IResourceWithEnvironment, ApplicationModel.IComputeResource { throw null; }
 
         [AspireExportIgnore(Reason = "RunAsHostedAgent is not yet implemented.")]
         public static ApplicationModel.IResourceBuilder<T> RunAsHostedAgent<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<Foundry.AzureCognitiveServicesProjectResource>? project = null, System.Action<Foundry.HostedAgentConfiguration>? configure = null)
@@ -130,7 +127,7 @@ namespace Aspire.Hosting.Foundry
         public override void SetName(global::Azure.Provisioning.CognitiveServices.CognitiveServicesProjectConnection provisionableResource, global::Azure.Provisioning.BicepValue<string> name) { }
     }
 
-    public partial class AzureCognitiveServicesProjectResource : AzureProvisionableAspireResourceWithParent<global::Azure.Provisioning.CognitiveServices.CognitiveServicesProject, FoundryResource>, ApplicationModel.IResourceWithConnectionString, ApplicationModel.IResource, ApplicationModel.IManifestExpressionProvider, ApplicationModel.IValueProvider, ApplicationModel.IValueWithReferences, Azure.IAzureComputeEnvironmentResource, ApplicationModel.IComputeEnvironmentResource
+    public partial class AzureCognitiveServicesProjectResource : AzureProvisionableAspireResourceWithParent<global::Azure.Provisioning.CognitiveServices.CognitiveServicesProject, FoundryResource>, ApplicationModel.IResourceWithConnectionString, ApplicationModel.IResource, ApplicationModel.IExpressionValue, ApplicationModel.IValueProvider, ApplicationModel.IManifestExpressionProvider, ApplicationModel.IValueWithReferences, Azure.IAzureComputeEnvironmentResource, ApplicationModel.IComputeEnvironmentResource
     {
         public AzureCognitiveServicesProjectResource(string name, System.Action<Azure.AzureResourceInfrastructure> configureInfrastructure, FoundryResource parent) : base(default!, default!, default!) { }
 
@@ -182,25 +179,6 @@ namespace Aspire.Hosting.Foundry
         public System.Threading.Tasks.Task PublishAsync(Publishing.ManifestPublishingContext ctx) { throw null; }
 
         public System.Threading.Tasks.Task<HostedAgentConfiguration> ToHostedAgentConfigurationAsync(Pipelines.PipelineStepContext context) { throw null; }
-    }
-
-    public partial class AzurePromptAgentResource : ApplicationModel.ExecutableResource, ApplicationModel.IComputeResource, ApplicationModel.IResource
-    {
-        public AzurePromptAgentResource(string name, string model, string? instructions) : base(default!, default!, default!) { }
-
-        public string Description { get { throw null; } set { } }
-
-        public string Instructions { get { throw null; } set { } }
-
-        public System.Collections.Generic.IDictionary<string, string> Metadata { get { throw null; } init { } }
-
-        public string Model { get { throw null; } set { } }
-
-        public StaticValueProvider<string> Version { get { throw null; } }
-
-        public System.Threading.Tasks.Task<global::Azure.AI.Projects.OpenAI.AgentVersion> DeployAsync(Pipelines.PipelineStepContext context, AzureCognitiveServicesProjectResource project) { throw null; }
-
-        public System.Threading.Tasks.Task PublishAsync(Publishing.ManifestPublishingContext ctx) { throw null; }
     }
 
     public static partial class AzureProvisionableAspireResourceExtensions
@@ -262,7 +240,7 @@ namespace Aspire.Hosting.Foundry
     }
 
     [AspireExport(ExposeProperties = true)]
-    public partial class FoundryDeploymentResource : ApplicationModel.Resource, ApplicationModel.IResourceWithParent<FoundryResource>, ApplicationModel.IResourceWithParent, ApplicationModel.IResource, ApplicationModel.IResourceWithConnectionString, ApplicationModel.IManifestExpressionProvider, ApplicationModel.IValueProvider, ApplicationModel.IValueWithReferences
+    public partial class FoundryDeploymentResource : ApplicationModel.Resource, ApplicationModel.IResourceWithParent<FoundryResource>, ApplicationModel.IResourceWithParent, ApplicationModel.IResource, ApplicationModel.IResourceWithConnectionString, ApplicationModel.IExpressionValue, ApplicationModel.IValueProvider, ApplicationModel.IManifestExpressionProvider, ApplicationModel.IValueWithReferences
     {
         public FoundryDeploymentResource(string name, string modelName, string modelVersion, string format, FoundryResource parent) : base(default!) { }
 
@@ -303,6 +281,7 @@ namespace Aspire.Hosting.Foundry
         public static partial class Anthropic
         {
             public static readonly FoundryModel ClaudeHaiku45;
+            public static readonly FoundryModel ClaudeMythosPreview;
             public static readonly FoundryModel ClaudeOpus41;
             public static readonly FoundryModel ClaudeOpus45;
             public static readonly FoundryModel ClaudeOpus46;
@@ -357,6 +336,7 @@ namespace Aspire.Hosting.Foundry
             public static readonly FoundryModel DeepseekR17b;
             public static readonly FoundryModel GptOss20b;
             public static readonly FoundryModel Mistral7bV02;
+            public static readonly FoundryModel NemotronSpeechStreamingEn06b;
             public static readonly FoundryModel Phi35Mini;
             public static readonly FoundryModel Phi3Mini128k;
             public static readonly FoundryModel Phi3Mini4k;
@@ -378,6 +358,10 @@ namespace Aspire.Hosting.Foundry
             public static readonly FoundryModel Qwen314b;
             public static readonly FoundryModel Qwen317b;
             public static readonly FoundryModel Qwen34b;
+            public static readonly FoundryModel Qwen3508b;
+            public static readonly FoundryModel Qwen352b;
+            public static readonly FoundryModel Qwen354b;
+            public static readonly FoundryModel Qwen359b;
             public static readonly FoundryModel Qwen38b;
             public static readonly FoundryModel Qwen3Vl2bInstruct;
             public static readonly FoundryModel Qwen3Vl4bInstruct;
@@ -424,6 +408,8 @@ namespace Aspire.Hosting.Foundry
             [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
             public static readonly FoundryModel LanguageDetection;
             public static readonly FoundryModel MaiDSR1;
+            public static readonly FoundryModel MaiTranscribe1;
+            public static readonly FoundryModel MaiVoice1;
             public static readonly FoundryModel ModelRouter;
             public static readonly FoundryModel Phi35MiniInstruct;
             public static readonly FoundryModel Phi35MoEInstruct;
@@ -546,6 +532,8 @@ namespace Aspire.Hosting.Foundry
             public static readonly FoundryModel Grok4;
             public static readonly FoundryModel Grok41FastNonReasoning;
             public static readonly FoundryModel Grok41FastReasoning;
+            public static readonly FoundryModel Grok420NonReasoning;
+            public static readonly FoundryModel Grok420Reasoning;
             public static readonly FoundryModel Grok4FastNonReasoning;
             public static readonly FoundryModel Grok4FastReasoning;
             public static readonly FoundryModel GrokCodeFast1;
@@ -553,7 +541,7 @@ namespace Aspire.Hosting.Foundry
     }
 
     [AspireExport]
-    public partial class FoundryResource : Azure.AzureProvisioningResource, ApplicationModel.IResourceWithEndpoints, ApplicationModel.IResource, ApplicationModel.IResourceWithConnectionString, ApplicationModel.IManifestExpressionProvider, ApplicationModel.IValueProvider, ApplicationModel.IValueWithReferences
+    public partial class FoundryResource : Azure.AzureProvisioningResource, ApplicationModel.IResourceWithEndpoints, ApplicationModel.IResource, ApplicationModel.IResourceWithConnectionString, ApplicationModel.IExpressionValue, ApplicationModel.IValueProvider, ApplicationModel.IManifestExpressionProvider, ApplicationModel.IValueWithReferences, Azure.IAzurePrivateEndpointTarget, Azure.IAzureNspAssociationTarget
     {
         public FoundryResource(string name, System.Action<Azure.AzureResourceInfrastructure> configureInfrastructure) : base(default!, default!) { }
 
@@ -569,6 +557,8 @@ namespace Aspire.Hosting.Foundry
 
         public Azure.BicepOutputReference Endpoint { get { throw null; } }
 
+        public Azure.BicepOutputReference Id { get { throw null; } }
+
         public bool IsEmulator { get { throw null; } }
 
         public Azure.BicepOutputReference NameOutputReference { get { throw null; } }
@@ -579,6 +569,10 @@ namespace Aspire.Hosting.Foundry
         public override global::Azure.Provisioning.CognitiveServices.CognitiveServicesAccount AddAsExistingResource(Azure.AzureResourceInfrastructure infra) { throw null; }
 
         System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string, ApplicationModel.ReferenceExpression>> ApplicationModel.IResourceWithConnectionString.GetConnectionProperties() { throw null; }
+
+        System.Collections.Generic.IEnumerable<string> Azure.IAzurePrivateEndpointTarget.GetPrivateDnsZoneNames() { throw null; }
+
+        System.Collections.Generic.IEnumerable<string> Azure.IAzurePrivateEndpointTarget.GetPrivateLinkGroupIds() { throw null; }
     }
 
     [AspireExport(ExposeProperties = true)]
@@ -613,21 +607,6 @@ namespace Aspire.Hosting.Foundry
 
         [AspireExportIgnore(Reason = "Azure SDK-specific type not usable from polyglot hosts.")]
         public System.Collections.Generic.IList<global::Azure.AI.Projects.OpenAI.AgentTool> Tools { get { throw null; } init { } }
-
-        public global::Azure.AI.Projects.AgentVersionCreationOptions ToAgentVersionCreationOptions() { throw null; }
-    }
-
-    public partial class PromptAgentConfiguration
-    {
-        public PromptAgentConfiguration(string model, string? instructions) { }
-
-        public string Description { get { throw null; } set { } }
-
-        public string? Instructions { get { throw null; } set { } }
-
-        public System.Collections.Generic.IDictionary<string, string> Metadata { get { throw null; } init { } }
-
-        public string Model { get { throw null; } set { } }
 
         public global::Azure.AI.Projects.AgentVersionCreationOptions ToAgentVersionCreationOptions() { throw null; }
     }
