@@ -30,6 +30,10 @@ network: defaults
 tools:
   github:
     toolsets: [repos, issues, pull_requests, search]
+    # Allow reading PR data from external contributors. These PRs have already
+    # been reviewed and merged by maintainers, so the default "approved" integrity
+    # gate is unnecessarily restrictive for a read-only changelog generator.
+    min-integrity: unapproved
   cache-memory:
 
 safe-outputs:
