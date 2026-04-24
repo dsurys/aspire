@@ -115,22 +115,24 @@ unchanged.
 
 For each merged PR that has not been excluded by feedback:
 
-### 5a. Determine product area(s)
+### 5a. Determine product area
 
-Classify each PR into **one or more** of these areas based on its labels, title, and
-changed file paths:
+Classify each PR into exactly **one** area based on its labels, title, and changed file
+paths. If a PR touches multiple areas, pick the **primary** area — the one most central
+to the change. Use this priority order when ambiguous: the area whose code is the main
+focus of the PR > the area matching a label > the area with the most changed files.
 
-| Area | Signals |
-|------|---------|
-| **CLI** | `src/Aspire.Cli/`, label contains "cli" |
-| **Dashboard** | `src/Aspire.Dashboard/`, label contains "dashboard" |
-| **AppHost** | `src/Aspire.Hosting*/` (except Testing), label contains "hosting" |
-| **Service Discovery** | `src/Aspire.ServiceDiscovery/` or related packages |
-| **Integrations** | `src/Components/`, label contains "integration" |
-| **Templates** | project template files, label contains "template" |
-| **Testing** | `src/Aspire.Hosting.Testing/`, label contains "testing" |
-| **Extensions** | `extension/`, label contains "extension" |
-| **Engineering** | `eng/`, CI workflows, build infrastructure |
+| Area | Emoji | Signals |
+|------|-------|---------|
+| **AppHost** | 🏗️ | `src/Aspire.Hosting*/` (except Testing), label contains "hosting" |
+| **CLI** | ⌨️ | `src/Aspire.Cli/`, label contains "cli" |
+| **Dashboard** | 📊 | `src/Aspire.Dashboard/`, label contains "dashboard" |
+| **Engineering** | ⚙️ | `eng/`, CI workflows, build infrastructure |
+| **Extensions** | 🧩 | `extension/`, label contains "extension" |
+| **Integrations** | 🔌 | `src/Components/`, label contains "integration" |
+| **Service Discovery** | 🔍 | `src/Aspire.ServiceDiscovery/` or related packages |
+| **Templates** | 📄 | project template files, label contains "template" |
+| **Testing** | 🧪 | `src/Aspire.Hosting.Testing/`, label contains "testing" |
 
 ### 5b. Write name and description
 
@@ -170,7 +172,8 @@ from Step 5. When a new PR relates to an existing entry, update that entry in-pl
 (append the PR number and refine the description) instead of creating a duplicate row.
 Apply all editorial feedback from Step 4.
 
-Sort entries by product area (alphabetical), then by name.
+Sort entries alphabetically by name within each area. Group areas alphabetically.
+Only include area sections that have at least one entry.
 
 Use this exact format:
 
@@ -180,12 +183,17 @@ Use this exact format:
 > Last updated: <current date and time in UTC>
 > PRs analyzed through: <end of time window in UTC>
 
-## Changes
+## 🏗️ AppHost
 
-| Product Area | Name | Description | Related PRs |
-|---|---|---|---|
-| AppHost | Feature name | Brief user-facing description | #1234, #1235 |
-| CLI, Dashboard | Another change | What this means for users | #1236 |
+- **Feature name** - Brief user-facing description (#1234, #1235)
+
+## ⌨️ CLI
+
+- **Another change** - What this means for users (#1236)
+
+## 📊 Dashboard
+
+- **Dashboard improvement** - Description of the change (#1237)
 
 ---
 
@@ -193,7 +201,7 @@ Use this exact format:
 feedback (e.g., "Exclude PR #1234", "Rename: X → Y", "Merge PRs #1234 and #5678").*
 ```
 
-If no changes exist yet, keep the table header with a single row: `| — | No changes recorded yet | — | — |`.
+If no changes exist yet, use a single line: `No changes recorded yet.`
 
 ## Step 7: Create or update the changelog issue
 
