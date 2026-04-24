@@ -121,6 +121,7 @@ Classify each PR into exactly **one** area based on its labels, title, and chang
 paths. If a PR touches multiple areas, pick the **primary** area — the one most central
 to the change. Use this priority order when ambiguous: the area whose code is the main
 focus of the PR > the area matching a label > the area with the most changed files.
+If a PR does not clearly fit any specific area, classify it as **Other**.
 
 | Area | Emoji | Signals |
 |------|-------|---------|
@@ -133,6 +134,7 @@ focus of the PR > the area matching a label > the area with the most changed fil
 | **Service Discovery** | 🔍 | `src/Aspire.ServiceDiscovery/` or related packages |
 | **Templates** | 📄 | project template files, label contains "template" |
 | **Testing** | 🧪 | `src/Aspire.Hosting.Testing/`, label contains "testing" |
+| **Other** | 📦 | Changes that don't fit any of the above areas |
 
 ### 5b. Write name and description
 
