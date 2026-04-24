@@ -34,10 +34,10 @@ tools:
 
 safe-outputs:
   create-issue:
-    title-prefix: "[13.3] Change log"
+    title-prefix: "[13.3] "
     labels: [changelog]
   update-issue:
-    title-prefix: "[13.3] Change log"
+    title-prefix: "[13.3] "
 
 timeout-minutes: 15
 ---
