@@ -69,10 +69,13 @@ Search for an **open** issue in this repository whose title is exactly `[13.3] C
 
 ## Step 2: Determine the time window
 
-Read the cache-memory key `changelog-13.3-last-run`.
-
-- If the key exists, parse it as an ISO 8601 timestamp and use it as the **start** of the window.
-- If the key does not exist (first run), look up the **creation date of the 13.3 milestone** and use that as the start. This ensures all PRs merged since the milestone was created are captured on the first run.
+- **If an existing changelog issue was found in Step 1**: read the cache-memory key
+  `changelog-13.3-last-run`. If the key exists, parse it as an ISO 8601 timestamp and
+  use it as the **start** of the window.
+  If the key does not exist, use the **creation date of the 13.3 milestone** as the start.
+- **If no existing issue was found** (first run): look up the **creation date of the
+  13.3 milestone** and use that as the start. Do **not** read the cache-memory key —
+  a fresh issue should include all PRs since the milestone was created.
 - The **end** of the window is the current time.
 
 ## Step 3: Gather merged PRs
