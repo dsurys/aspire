@@ -79,8 +79,13 @@ Search for pull requests in this repository that match **all** of these criteria
 2. Milestone is **13.3**.
 3. Merged **after** the start timestamp from Step 2.
 
-For each PR collect: number, title, author, body/description, labels, and the list of
-changed files.
+**Exclude PRs authored by bots** (e.g., `dependabot[bot]`, `dotnet-maestro[bot]`,
+`github-actions[bot]`, or any author whose login ends with `[bot]`). These are
+typically automated dependency bumps or infrastructure changes that do not belong in
+a user-facing changelog.
+
+For each remaining PR collect: number, title, author, body/description, labels, and
+the list of changed files.
 
 ## Step 4: Process editorial feedback from comments
 
