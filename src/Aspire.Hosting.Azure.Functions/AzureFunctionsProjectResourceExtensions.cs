@@ -229,14 +229,13 @@ public static class AzureFunctionsProjectResourceExtensions
                 if (context.ExecutionContext.IsRunMode)
                 {
                     var launchProfile = context.Resource.GetEffectiveLaunchProfile()?.LaunchProfile;
-                    if (launchProfile is null)
+                    if (launchProfile is not null)
                     {
-                        return;
-                    }
-                    foreach (var envVar in launchProfile.EnvironmentVariables)
-                    {
-                        var value = Environment.ExpandEnvironmentVariables(envVar.Value);
-                        context.EnvironmentVariables.TryAdd(envVar.Key, value);
+                        foreach (var envVar in launchProfile.EnvironmentVariables)
+                        {
+                            var value = Environment.ExpandEnvironmentVariables(envVar.Value);
+                            context.EnvironmentVariables.TryAdd(envVar.Key, value);
+                        }
                     }
                 }
             })
