@@ -587,7 +587,7 @@ public class AzureFunctionsTests
                 {
                     CommandLineArgs = "--useHttps",
                     LaunchBrowser = false,
-                    EnvironmentVariables = { { CustomEnvironmentVariable, "Somve value" } }
+                    EnvironmentVariables = { { CustomEnvironmentVariable, "Some value" } }
                 }
             }
         };
@@ -855,7 +855,7 @@ public class AzureFunctionsTests
     }
 
     [Fact]
-    public async Task AddAzureFunctionsProject_DoesNotAddsEnvironmentVariables_FromLaunchProfile_WhnInPublishMode()
+    public async Task AddAzureFunctionsProject_DoesNotAddEnvironmentVariables_FromLaunchProfile_WhenInPublishMode()
     {
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
 
