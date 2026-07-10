@@ -851,7 +851,7 @@ public class AzureFunctionsTests(ITestOutputHelper outputHelper)
             await envAnnotation.Callback(context);
         }
 
-        Assert.True(context.EnvironmentVariables.ContainsKey(TestProjectWithEnvironmentVariables.CustomEnvironmentVariable));
+        Assert.Equal("Some value", context.EnvironmentVariables[TestProjectWithEnvironmentVariables.CustomEnvironmentVariable]);
     }
 
     [Fact]
