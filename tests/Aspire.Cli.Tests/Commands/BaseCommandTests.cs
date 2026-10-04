@@ -4,6 +4,10 @@
 using System.Globalization;
 using Aspire.Cli.Commands;
 using Aspire.Cli.Interaction;
+#if DEBUG
+using Aspire.Cli.NuGet;
+using Aspire.Cli.Packaging;
+#endif
 using Aspire.Cli.Projects;
 using Aspire.Cli.Resources;
 using Aspire.Cli.Tests.TestServices;
@@ -21,6 +25,9 @@ public class BaseCommandTests(ITestOutputHelper outputHelper)
     [InlineData("ps --format table", false)]
     [InlineData("ps --format invalid", false)]
     [InlineData("docs --format json", false)]
+    [InlineData("do --list-steps --format json", true)]
+    [InlineData("do --list-steps --format=json", true)]
+    [InlineData("do --list-steps", false)]
     public async Task BaseCommand_FormatOption_SetsConsoleOutputCorrectly(string args, bool expectErrorConsole)
     {
         using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
@@ -112,10 +119,84 @@ public class BaseCommandTests(ITestOutputHelper outputHelper)
         Assert.Equal(0, testInteractionService.DisplayEmptyLineCount);
     }
 
+#if DEBUG
+    [Fact]
+    public async Task BaseCommand_UpdateNotificationValidationFailureEscapesInDebugBuilds()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var expectedException = new PackageMetadataPrefetchingValidationException("Package metadata prefetching validation failed.");
+        var testNotifier = new TestCliUpdateNotifier
+        {
+            NotifyIfUpdateAvailableCallback = () => throw expectedException
+        };
+        var services = CliTestHelper.CreateServiceCollection(workspace, outputHelper, options =>
+        {
+            options.CliUpdateNotifierFactory = _ => testNotifier;
+        });
+        using var provider = services.BuildServiceProvider();
+
+        var command = provider.GetRequiredService<RootCommand>();
+        var result = command.Parse("stop");
+        var action = Assert.IsAssignableFrom<System.CommandLine.Invocation.AsynchronousCommandLineAction>(result.Action);
+
+        var actualException = await Assert.ThrowsAsync<PackageMetadataPrefetchingValidationException>(() => action.InvokeAsync(result, TestContext.Current.CancellationToken));
+
+        Assert.Same(expectedException, actualException);
+    }
+
+    [Fact]
+    public async Task BaseCommand_ExecuteValidationFailureEscapesInDebugBuilds()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var services = CliTestHelper.CreateServiceCollection(workspace, outputHelper, options =>
+        {
+            options.NuGetPackageCacheFactory = _ => new FakeNuGetPackageCache();
+        });
+        using var provider = services.BuildServiceProvider();
+        var command = new TemplateMetadataConsumingCommand(
+            provider.GetRequiredService<CommonCommandServices>(),
+            provider.GetRequiredService<IPackagingService>(),
+            workspace.WorkspaceRoot);
+        var result = command.Parse("test");
+        var action = Assert.IsAssignableFrom<System.CommandLine.Invocation.AsynchronousCommandLineAction>(result.Action);
+
+        var exception = await Assert.ThrowsAsync<PackageMetadataPrefetchingValidationException>(() => action.InvokeAsync(result, TestContext.Current.CancellationToken));
+
+        Assert.Contains(nameof(BaseCommand.PrefetchesTemplatePackageMetadata), exception.Message);
+    }
+#endif
+
+#if !DEBUG
+    [Fact]
+    public async Task BaseCommand_UpdateNotificationFailureIsIgnoredInReleaseBuilds()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var testNotifier = new TestCliUpdateNotifier
+        {
+            NotifyIfUpdateAvailableCallback = () => throw new InvalidOperationException("Update notification failed.")
+        };
+        var services = CliTestHelper.CreateServiceCollection(workspace, outputHelper, options =>
+        {
+            options.CliUpdateNotifierFactory = _ => testNotifier;
+        });
+        using var provider = services.BuildServiceProvider();
+
+        var command = provider.GetRequiredService<RootCommand>();
+        var result = command.Parse("stop");
+
+        _ = await result.InvokeAsync().DefaultTimeout();
+
+        Assert.True(testNotifier.NotifyWasCalled);
+    }
+#endif
+
     [Theory]
     [InlineData("run --format json", false)]
     [InlineData("run", true)]
     [InlineData("docs", false)]
+    [InlineData("do --list-steps --format json", false)]
+    [InlineData("do --list-steps --format=json", false)]
+    [InlineData("do --list-steps --format table", true)]
     public async Task BaseCommand_UpdateNotification_RespectJsonFormat(string args, bool expectNotifyCalled)
     {
         using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
@@ -214,6 +295,84 @@ public class BaseCommandTests(ITestOutputHelper outputHelper)
     }
 
     [Fact]
+    public async Task BaseCommand_OnFailure_WithMessageActions_CombinesErrorAndDiagnosticLogs()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var cliLogPath = Path.Combine(workspace.WorkspaceRoot.FullName, "current-cli.log");
+        var appHostLogPath = Path.Combine(workspace.WorkspaceRoot.FullName, "apphost-cli.log");
+        var backchannelMonitor = new TestAuxiliaryBackchannelMonitor
+        {
+            ScanAsyncCallback = _ => throw new InvalidOperationException("Something went wrong")
+        };
+        (string? ErrorMessage, string CliLogPath, string? AppHostLogPath)? capturedFailure = null;
+
+        var services = CliTestHelper.CreateServiceCollection(workspace, outputHelper, options =>
+        {
+            options.ExtensionBackchannelFactory = _ => new TestExtensionBackchannel();
+            options.InteractionServiceFactory = serviceProvider => new TestExtensionInteractionService(serviceProvider)
+            {
+                TryDisplayCommandFailureAsyncCallback = (errorMessage, capturedCliLogPath, capturedAppHostLogPath, _) =>
+                {
+                    capturedFailure = (errorMessage, capturedCliLogPath, capturedAppHostLogPath);
+                    return Task.FromResult(true);
+                }
+            };
+            options.AuxiliaryBackchannelMonitorFactory = _ => backchannelMonitor;
+            options.CliExecutionContextFactory = _ =>
+            {
+                var context = workspace.CreateExecutionContext(logFilePath: cliLogPath);
+                context.AppHostCliLogFilePath = appHostLogPath;
+                return context;
+            };
+        });
+        using var provider = services.BuildServiceProvider();
+
+        var interactionService = Assert.IsType<TestExtensionInteractionService>(provider.GetRequiredService<IInteractionService>());
+        var result = provider.GetRequiredService<RootCommand>().Parse("ps");
+
+        var exitCode = await result.InvokeAsync().DefaultTimeout();
+
+        Assert.Equal(CliExitCodes.InvalidCommand, exitCode);
+        Assert.NotNull(capturedFailure);
+        Assert.Contains("Something went wrong", capturedFailure.Value.ErrorMessage);
+        Assert.Equal(cliLogPath, capturedFailure.Value.CliLogPath);
+        Assert.Equal(appHostLogPath, capturedFailure.Value.AppHostLogPath);
+        Assert.Empty(interactionService.DisplayedErrors);
+        Assert.Empty(interactionService.DisplayedMessages);
+    }
+
+    [Fact]
+    public async Task BaseCommand_OnFailure_WithoutMessageActions_PreservesLegacyNotifications()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var cliLogPath = Path.Combine(workspace.WorkspaceRoot.FullName, "current-cli.log");
+        var backchannelMonitor = new TestAuxiliaryBackchannelMonitor
+        {
+            ScanAsyncCallback = _ => throw new InvalidOperationException("Something went wrong")
+        };
+
+        var services = CliTestHelper.CreateServiceCollection(workspace, outputHelper, options =>
+        {
+            options.ExtensionBackchannelFactory = _ => new TestExtensionBackchannel();
+            options.InteractionServiceFactory = serviceProvider => new TestExtensionInteractionService(serviceProvider);
+            options.AuxiliaryBackchannelMonitorFactory = _ => backchannelMonitor;
+            options.CliExecutionContextFactory = _ => workspace.CreateExecutionContext(logFilePath: cliLogPath);
+        });
+        using var provider = services.BuildServiceProvider();
+
+        var interactionService = Assert.IsType<TestExtensionInteractionService>(provider.GetRequiredService<IInteractionService>());
+        var result = provider.GetRequiredService<RootCommand>().Parse("ps");
+
+        var exitCode = await result.InvokeAsync().DefaultTimeout();
+
+        Assert.Equal(CliExitCodes.InvalidCommand, exitCode);
+        Assert.Single(interactionService.DisplayedErrors);
+        Assert.Empty(interactionService.DisplayedErrorsWithActions);
+        var logMessage = Assert.Single(interactionService.DisplayedMessages);
+        Assert.Contains(cliLogPath, logMessage.Message);
+    }
+
+    [Fact]
     public async Task BaseCommand_OnCancellationWithErrorExitCode_DisplaysCancellationMessageOnStderr()
     {
         using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
@@ -239,8 +398,9 @@ public class BaseCommandTests(ITestOutputHelper outputHelper)
         // add catches OperationCanceledException and returns CommandResult.Cancelled() (exit code 130)
         Assert.Equal(CliExitCodes.Cancelled, exitCode);
 
-        var cancellationOverride = Assert.Single(testInteractionService.DisplayedCancellations);
-        Assert.Equal(ConsoleOutput.Error, cancellationOverride);
+        var cancellation = Assert.Single(testInteractionService.DisplayedCancellations);
+        Assert.Null(cancellation.Message);
+        Assert.Equal(ConsoleOutput.Error, cancellation.ConsoleOverride);
     }
 
     [Fact]
@@ -272,8 +432,9 @@ public class BaseCommandTests(ITestOutputHelper outputHelper)
 
         Assert.Equal(CliExitCodes.Success, exitCode);
 
-        var cancellationOverride = Assert.Single(testInteractionService.DisplayedCancellations);
-        Assert.Null(cancellationOverride);
+        var cancellation = Assert.Single(testInteractionService.DisplayedCancellations);
+        Assert.Null(cancellation.Message);
+        Assert.Null(cancellation.ConsoleOverride);
     }
 
     [Fact]
@@ -642,4 +803,21 @@ public class BaseCommandTests(ITestOutputHelper outputHelper)
         var expectedError = string.Format(CultureInfo.CurrentCulture, SharedCommandStrings.UnrecognizedOptionDidYouMeanFormat, "--AppHost", "--apphost");
         Assert.Single(testInteractionService.DisplayedErrors, expectedError);
     }
+
+#if DEBUG
+    private sealed class TemplateMetadataConsumingCommand(
+        CommonCommandServices services,
+        IPackagingService packagingService,
+        DirectoryInfo workingDirectory)
+        : BaseCommand("test", "Test command", services)
+    {
+        protected override async Task<CommandResult> ExecuteAsync(System.CommandLine.ParseResult parseResult, CancellationToken cancellationToken)
+        {
+            var channel = (await packagingService.GetChannelsAsync(cancellationToken)).First();
+            _ = await channel.GetTemplatePackagesAsync(workingDirectory, cancellationToken);
+
+            return CommandResult.Success();
+        }
+    }
+#endif
 }

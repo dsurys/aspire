@@ -20,6 +20,30 @@ public partial class MobileNavMenu : ComponentBase, IAsyncDisposable
     private bool _keyboardNavigationInitializing;
     private bool _disposed;
 
+    [Parameter, EditorRequired]
+    public required bool IsNavMenuOpen { get; set; }
+
+    [Parameter]
+    public bool HasResourceTerminals { get; set; }
+
+    [Parameter, EditorRequired]
+    public required Action CloseNavMenu { get; set; }
+
+    [Parameter, EditorRequired]
+    public required Func<Task> LaunchHelpAsync { get; set; }
+
+    [Parameter, EditorRequired]
+    public required Func<Task> LaunchAIAgentsAsync { get; set; }
+
+    [Parameter, EditorRequired]
+    public required bool IsAgentHelpEnabled { get; set; }
+
+    [Parameter, EditorRequired]
+    public required Func<Task> LaunchNotificationsAsync { get; set; }
+
+    [Parameter, EditorRequired]
+    public required Func<Task> LaunchSettingsAsync { get; set; }
+
     [Inject]
     public required NavigationManager NavigationManager { get; init; }
 
@@ -131,6 +155,7 @@ public partial class MobileNavMenu : ComponentBase, IAsyncDisposable
                 ActiveIcon: DesktopNavMenu.ConsoleLogsIcon(active: true),
                 LinkMatchRegex: GetNonIndexPageRegex(DashboardUrls.ConsoleLogsUrl())
             );
+
         }
 
         yield return new MobileNavMenuEntry(
@@ -156,6 +181,17 @@ public partial class MobileNavMenu : ComponentBase, IAsyncDisposable
             ActiveIcon: DesktopNavMenu.MetricsIcon(active: true),
             LinkMatchRegex: GetNonIndexPageRegex(DashboardUrls.MetricsUrl())
         );
+
+        if (DashboardClient.IsEnabled && HasResourceTerminals)
+        {
+            yield return new MobileNavMenuEntry(
+                Loc[nameof(Resources.Layout.NavMenuTerminalsTab)],
+                () => NavigateToAsync(DashboardUrls.TerminalsUrl()),
+                DesktopNavMenu.TerminalsIcon(),
+                ActiveIcon: DesktopNavMenu.TerminalsIcon(active: true),
+                LinkMatchRegex: GetNonIndexPageRegex(DashboardUrls.TerminalsUrl())
+            );
+        }
 
         yield return new MobileNavMenuEntry(
             Loc[nameof(Resources.Layout.MainLayoutAspireRepoLink)],

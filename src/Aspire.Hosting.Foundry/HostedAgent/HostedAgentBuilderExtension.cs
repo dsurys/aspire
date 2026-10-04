@@ -1,6 +1,8 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+#pragma warning disable ASPIREPROJECTS001
+
 using System.Net.Http.Json;
 using System.Text.Json;
 using Aspire.Hosting.ApplicationModel;
@@ -77,10 +79,12 @@ public static class HostedAgentResourceBuilderExtensions
     /// <param name="configure">A callback to configure hosted agent deployment options.</param>
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/> for chaining.</returns>
     /// <remarks>
-    /// This C# convenience overload is not exported to polyglot app hosts. Polyglot hosts must declare the
-    /// hosted agent protocol and protocol version explicitly. The configuration callback is applied in publish mode.
+    /// This C# convenience overload defaults to the Responses protocol version 2.0.0, mirroring the exported
+    /// <c>asHostedAgent</c> entry point used by polyglot app hosts. Polyglot hosts that need a different protocol
+    /// or version should use the exported <c>asHostedAgentWithProtocol</c> entry point instead. The configuration
+    /// callback is applied in publish mode.
     /// </remarks>
-    [AspireExportIgnore(Reason = "C# convenience overload; polyglot hosts must pass protocol and version explicitly.")]
+    [AspireExportIgnore(Reason = "Action callback shape is awkward for polyglot hosts; the defaulted asHostedAgent export covers this case.")]
     public static IResourceBuilder<T> AsHostedAgent<T>(
         this IResourceBuilder<T> builder,
         IResourceBuilder<AzureCognitiveServicesProjectResource>? project,
@@ -111,14 +115,42 @@ public static class HostedAgentResourceBuilderExtensions
         return AsHostedAgent(builder, project: null, configure);
     }
 
-    // The internal AsHostedAgentForExport overload below is the polyglot-exported version of AsHostedAgent.
-    // The CLR method name differs from AsHostedAgent to avoid C# overload ambiguity with the Action-based
-    // overload, but the ATS capability name must stay "asHostedAgent" for compatibility.
-    // .NET callers should keep using the Action<HostedAgentConfiguration> overload when they need the
-    // full HostedAgentConfiguration surface (tools, content filters, additional protocol versions, etc.).
+    // The internal adapters below keep ATS compatibility without adding CLR overloads that would be
+    // ambiguous with the public Action-based overloads. The original asHostedAgent capability retains
+    // its Responses/2.0.0 defaults, while asHostedAgentWithProtocol exposes explicit protocol selection.
+    // .NET callers should keep using the public overloads when they need the full HostedAgentConfiguration
+    // surface (tools, content filters, additional protocol versions, etc.).
 
     /// <summary>
-    /// Configures the resource to run and publish as a hosted agent in Microsoft Foundry, targeting the specified Foundry project.
+    /// Configures the resource to run and publish as a hosted agent in Microsoft Foundry using the Responses protocol version 2.0.0.
+    /// </summary>
+    /// <typeparam name="T">The type of resource being configured.</typeparam>
+    /// <param name="builder">The resource builder for the compute resource.</param>
+    /// <param name="project">The Microsoft Foundry project the hosted agent is deployed into.</param>
+    /// <param name="options">Optional hosted agent deployment options. Options apply in publish mode.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/> for chaining.</returns>
+    /// <ats-returns>The resource builder.</ats-returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="builder"/> or <paramref name="project"/> is <see langword="null"/>.</exception>
+    [AspireExport("asHostedAgent", MethodName = "asHostedAgent")]
+    internal static IResourceBuilder<T> AsHostedAgentForExport<T>(
+        this IResourceBuilder<T> builder,
+        IResourceBuilder<AzureCognitiveServicesProjectResource> project,
+        HostedAgentOptions? options = null)
+        where T : IResourceWithEndpoints, IResourceWithEnvironment, IComputeResource
+    {
+        ArgumentNullException.ThrowIfNull(project);
+
+        Action<HostedAgentConfiguration>? configure = options is null ? null : options.ApplyTo;
+        return ConfigureAsHostedAgent(
+            builder,
+            project,
+            HostedAgentProtocol.Responses,
+            AzureHostedAgentResource.DefaultResponsesProtocolVersion,
+            configure);
+    }
+
+    /// <summary>
+    /// Configures the resource to run and publish as a hosted agent in Microsoft Foundry using an explicit protocol and version.
     /// </summary>
     /// <typeparam name="T">The type of resource being configured.</typeparam>
     /// <param name="builder">The resource builder for the compute resource.</param>
@@ -129,8 +161,8 @@ public static class HostedAgentResourceBuilderExtensions
     /// <returns>A reference to the <see cref="IResourceBuilder{T}"/> for chaining.</returns>
     /// <ats-returns>The resource builder.</ats-returns>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="builder"/> or <paramref name="project"/> is <see langword="null"/>.</exception>
-    [AspireExport("asHostedAgent", MethodName = "asHostedAgent")]
-    internal static IResourceBuilder<T> AsHostedAgentForExport<T>(
+    [AspireExport("asHostedAgentWithProtocol")]
+    internal static IResourceBuilder<T> AsHostedAgentWithProtocolForExport<T>(
         this IResourceBuilder<T> builder,
         IResourceBuilder<AzureCognitiveServicesProjectResource> project,
         HostedAgentProtocol protocol,
@@ -141,7 +173,7 @@ public static class HostedAgentResourceBuilderExtensions
         ArgumentNullException.ThrowIfNull(project);
 
         Action<HostedAgentConfiguration>? configure = options is null ? null : options.ApplyTo;
-        return ConfigureAsHostedAgent(builder, project: project, protocol, protocolVersion, configure: configure);
+        return ConfigureAsHostedAgent(builder, project, protocol, protocolVersion, configure);
     }
 
     /// <summary>
@@ -443,6 +475,12 @@ public static class HostedAgentResourceBuilderExtensions
         {
             target = containerResourceBuilder.Resource;
         }
+        else if (resource is IDotnetProgramResource &&
+                 resource.SupportsDotnetProgramPublishing() &&
+                 resource is IResourceWithEnvironment programTarget)
+        {
+            target = programTarget;
+        }
         else if (resource is ExecutableResource executableResource)
         {
             // Ensure we have a container resource to deploy.
@@ -459,10 +497,6 @@ public static class HostedAgentResourceBuilderExtensions
                 throw new InvalidOperationException($"Unable to create hosted agent for resource '{resource.Name}' because it could not be converted to a container resource.");
             }
         }
-        else if (resource is ProjectResource)
-        {
-            target = resource;
-        }
         else
         {
             throw new InvalidOperationException($"Unable to create hosted agent for resource '{resource.Name}' because it is not a container, executable, or project resource.");
@@ -470,7 +504,7 @@ public static class HostedAgentResourceBuilderExtensions
 
         EnsureDefaultHostedAgentEndpoint(builder, target);
 
-        if (target is ProjectResource projectTarget)
+        if (target is IDotnetProgramResource projectTarget)
         {
             // Foundry hosted agents are containerized and the platform owns the listening port contract.
             // Keep the user's local endpoint metadata intact, but do not emit project endpoint variables
@@ -503,7 +537,7 @@ public static class HostedAgentResourceBuilderExtensions
         // Unlike referencing a first-class Azure resource, it does not give the consumer a managed
         // identity or any RBAC on the Foundry account, so calls to the agent's invocation endpoint
         // fail with 401/403 at runtime. Stamp a ReferenceRoleAssignmentAnnotation on the agent's
-        // target so AzureResourcePreparer grants the "Azure AI User" role on the owning Foundry
+        // target so AzureResourcePreparer grants the "Foundry User" role on the owning Foundry
         // account to every consumer that references this agent, and provisions the identity that
         // makes ACA inject AZURE_CLIENT_ID.
         StampHostedAgentConsumerRoleAnnotation(target, projectResource.Parent);
@@ -511,17 +545,17 @@ public static class HostedAgentResourceBuilderExtensions
 
     private static void StampHostedAgentConsumerRoleAnnotation(IResourceWithEnvironment target, FoundryResource account)
     {
-        // Grant only the "Azure AI User" role required to invoke the hosted agent. We deliberately do
+        // Grant only the "Foundry User" role required to invoke the hosted agent. We deliberately do
         // not union the account's default data-plane roles here:
         //  - A consumer that also references the account directly still receives those defaults through
         //    AzureResourcePreparer's normal reference walk (they are preserved when GetAllRoleAssignments
         //    unions per target).
         //  - A consumer that declares explicit role assignments on the account intentionally suppresses
         //    the account defaults; folding them back in here would defeat that suppression.
-        // So the minimal, least-privilege grant for a pure agent consumer is "Azure AI User" alone.
+        // So the minimal, least-privilege grant for a pure agent consumer is "Foundry User" alone.
         var roles = new HashSet<RoleDefinition>
         {
-            new(AzureHostedAgentResource.AzureAIUserRoleDefinitionId, "Azure AI User")
+            new(FoundryResource.FoundryUserRoleDefinitionId, "Foundry User")
         };
 
 #pragma warning disable ASPIREAZURE003 // Type is for evaluation purposes only and is subject to change or removal in future updates.

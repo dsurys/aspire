@@ -19,6 +19,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
+#pragma warning disable ASPIRETERMINAL001 // Internal consumer of the experimental AppHost terminal API.
+
 namespace Aspire.Hosting.Dashboard;
 
 /// <summary>
@@ -50,7 +52,8 @@ internal sealed class DashboardServiceHost : IHostedService
         ResourceLoggerService resourceLoggerService,
         ResourceCommandService resourceCommandService,
         InteractionService interactionService,
-        IFileSystemService fileSystemService)
+        IInteractionFileUploadStore fileUploadStore,
+        TerminalService terminalService)
     {
         _logger = loggerFactory.CreateLogger<DashboardServiceHost>();
 
@@ -109,8 +112,8 @@ internal sealed class DashboardServiceHost : IHostedService
             builder.Services.AddSingleton(resourceNotificationService);
             builder.Services.AddSingleton(resourceLoggerService);
             builder.Services.AddSingleton(interactionService);
-            builder.Services.AddSingleton(fileSystemService);
-            builder.Services.AddSingleton<IFileUploadStore, FileUploadStore>();
+            builder.Services.AddSingleton(fileUploadStore);
+            builder.Services.AddSingleton(terminalService);
 
             builder.WebHost.ConfigureKestrel(ConfigureKestrel);
 

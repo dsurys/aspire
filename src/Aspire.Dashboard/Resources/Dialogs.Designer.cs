@@ -61,12 +61,14 @@ namespace Aspire.Dashboard.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Give AI agents deep observability into your app so they can diagnose issues faster and verify fixes with confidence 🚀
+        ///   Looks up a localized string similar to Aspire gives AI coding agents deep observability into your app using the same information visible in the dashboard. Agents use telemetry to diagnose issues faster and verify fixes with confidence. 🚀
         ///
         ///- 📦 Resource state, health checks, and relationships
         ///- 🖥️ Console logs
         ///- 📊 Distributed traces
         ///- 🪵 Structured logs
+        ///
+        ///## Getting started
         ///
         ///AI agents access dashboard telemetry through the Aspire CLI. If you haven’t installed it yet, [install the Aspire CLI]({1}).
         ///
@@ -85,7 +87,7 @@ namespace Aspire.Dashboard.Resources {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Give AI agents deep observability into your app so they can diagnose issues faster and verify fixes with confidence 🚀
+        ///   Looks up a localized string similar to Aspire gives AI coding agents deep observability into your app using the same information visible in the dashboard. Agents use telemetry to diagnose issues faster and verify fixes with confidence. 🚀
         ///
         ///- 📊 Distributed traces
         ///- 🔗 Trace spans
@@ -402,6 +404,15 @@ namespace Aspire.Dashboard.Resources {
         public static string GenAILLMBadgeText {
             get {
                 return ResourceManager.GetString("GenAILLMBadgeText", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Generative AI messages.
+        /// </summary>
+        public static string GenAIMessageTreeLabel {
+            get {
+                return ResourceManager.GetString("GenAIMessageTreeLabel", resourceCulture);
             }
         }
         
@@ -836,7 +847,16 @@ namespace Aspire.Dashboard.Resources {
                 return ResourceManager.GetString("HelpDialogTogglePanelOrientation", resourceCulture);
             }
         }
-        
+
+        /// <summary>
+        ///   Looks up a localized string similar to Toggle terminal.
+        /// </summary>
+        public static string HelpDialogToggleTerminalDock {
+            get {
+                return ResourceManager.GetString("HelpDialogToggleTerminalDock", resourceCulture);
+            }
+        }
+
         /// <summary>
         ///   Looks up a localized string similar to Cancel.
         /// </summary>
@@ -1115,7 +1135,7 @@ namespace Aspire.Dashboard.Resources {
                 return ResourceManager.GetString("SettingsDialogDashboardLogsAndTelemetry", resourceCulture);
             }
         }
-        
+
         /// <summary>
         ///   Looks up a localized string similar to Runtime: {0}.
         /// </summary>

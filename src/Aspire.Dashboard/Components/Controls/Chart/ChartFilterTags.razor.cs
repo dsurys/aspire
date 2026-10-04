@@ -21,15 +21,10 @@ public partial class ChartFilterTags : IDisposable
     [Parameter, EditorRequired]
     public required EventCallback<DimensionFilterViewModel> OnSelectionChanged { get; set; }
 
-    // Prevent magic string for dictionary keys
-    private const string KeyForDimensionValue = "dimensionValue";
-    private const string KeyForIsIncludedInFilters = "isIncludedInFilters";
+    [Parameter, EditorRequired]
+    public required EventCallback<DimensionFilterViewModel> OnShowPopover { get; set; }
 
-    // Maximum number of tags to render in the FluentOverflow. The visible area fits ~5-7 tags;
-    // rendering 20 gives FluentOverflow enough items to measure correctly. Items beyond this
-    // limit are treated as pre-overflowed and counted in the "+N" badge without being added to
-    // the DOM, avoiding hundreds of elements triggering an expensive forced reflow.
-    private const int MaxRenderedTags = 20;
+    private const int MaxRenderedOverflowItems = 20;
 
     protected override void OnInitialized()
     {
@@ -43,35 +38,26 @@ public partial class ChartFilterTags : IDisposable
         InvokeAsync(StateHasChanged);
     }
 
-    private async Task OnTagSelectionChangedAsync(DimensionValueViewModel tag, bool isChecked)
+    private Task OnTagClickedAsync(MouseEventArgs args, DimensionValueViewModel tag)
     {
-        Filter.OnTagSelectionChanged(tag, isChecked);
+        return OnTagActivatedAsync(tag, args.ShiftKey);
+    }
+
+    private async Task OnTagActivatedAsync(DimensionValueViewModel tag, bool toggleSelection)
+    {
+        if (toggleSelection)
+        {
+            Filter.OnTagSelectionChanged(tag, !Filter.SelectedValues.Contains(tag));
+        }
+        else
+        {
+            Filter.SetSelectedValues([tag]);
+        }
+
         await OnSelectionChanged.InvokeAsync(Filter);
     }
 
-    private async Task OnTagKeyDownAsync(KeyboardEventArgs args, DimensionValueViewModel tag, bool isChecked)
-    {
-        if (args.Key is "Enter" or " ")
-        {
-            await OnTagSelectionChangedAsync(tag, isChecked);
-        }
-    }
-
-    private void ShowPopover()
-    {
-        Filter.PopupVisible = true;
-        Filter.NotifyStateChanged?.Invoke();
-    }
-
-    private Task OnOverflowTagKeyDownAsync(KeyboardEventArgs args)
-    {
-        if (args.Key is "Enter" or " ")
-        {
-            ShowPopover();
-        }
-
-        return Task.CompletedTask;
-    }
+    private Task ShowPopoverAsync() => OnShowPopover.InvokeAsync(Filter);
 
     /// <summary>
     /// Orders dimension values numerically if all values are parsable as doubles;

@@ -3,11 +3,12 @@
 
 #pragma warning disable ASPIREEXTENSION001
 #pragma warning disable ASPIRECERTIFICATES001
+#pragma warning disable ASPIREPROJECTS001 // WithProjectDefaults is experimental.
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Dashboard;
-using Aspire.Hosting.Dcp.Model;
 using Aspire.Hosting.Utils;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
@@ -97,7 +98,7 @@ public static class ProjectResourceBuilderExtensions
     /// </code>
     /// </example>
     /// </remarks>
-    [AspireExportIgnore(Reason = "Polyglot app hosts use the internal addProject dispatcher export.")]
+    [AspireExportIgnore(Reason = "Polyglot AppHosts use the internal addProject dispatcher export.")]
     public static IResourceBuilder<ProjectResource> AddProject(this IDistributedApplicationBuilder builder, [ResourceName] string name, string projectPath)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -208,7 +209,7 @@ public static class ProjectResourceBuilderExtensions
     /// </code>
     /// </example>
     /// </remarks>
-    [AspireExportIgnore(Reason = "Polyglot app hosts use the internal addProject dispatcher export.")]
+    [AspireExportIgnore(Reason = "Polyglot AppHosts use the internal addProject dispatcher export.")]
     public static IResourceBuilder<ProjectResource> AddProject(this IDistributedApplicationBuilder builder, [ResourceName] string name, string projectPath, string? launchProfileName)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -274,7 +275,6 @@ public static class ProjectResourceBuilderExtensions
         var project = new ProjectResource(name);
         return builder.AddResource(project)
                       .WithAnnotation(projectMetadata)
-                      .WithDebugSupport(mode => new ProjectLaunchConfiguration { ProjectPath = projectMetadata.ProjectPath, Mode = mode }, "project")
                       .WithProjectDefaults(options);
     }
 
@@ -303,7 +303,7 @@ public static class ProjectResourceBuilderExtensions
     /// </code>
     /// </example>
     /// </remarks>
-    [AspireExportIgnore(Reason = "Polyglot app hosts use the internal addProject dispatcher export.")]
+    [AspireExportIgnore(Reason = "Polyglot AppHosts use the internal addProject dispatcher export.")]
     public static IResourceBuilder<ProjectResource> AddProject(this IDistributedApplicationBuilder builder, [ResourceName] string name, string projectPath, Action<ProjectResourceOptions> configure)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -320,7 +320,6 @@ public static class ProjectResourceBuilderExtensions
 
         return builder.AddResource(project)
                       .WithAnnotation(new ProjectMetadata(projectPath))
-                      .WithDebugSupport(mode => new ProjectLaunchConfiguration { ProjectPath = projectPath, Mode = mode }, "project")
                       .WithProjectDefaults(options);
     }
 
@@ -349,7 +348,7 @@ public static class ProjectResourceBuilderExtensions
     /// </example>
     /// </remarks>
     [Experimental("ASPIRECSHARPAPPS001", UrlFormat = "https://aka.ms/aspire/diagnostics/{0}")]
-    [AspireExportIgnore(Reason = "Polyglot app hosts use the internal addCSharpApp dispatcher export.")]
+    [AspireExportIgnore(Reason = "Polyglot AppHosts use the internal addCSharpApp dispatcher export.")]
     public static IResourceBuilder<ProjectResource> AddCSharpApp(this IDistributedApplicationBuilder builder, string name, string path)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -401,7 +400,7 @@ public static class ProjectResourceBuilderExtensions
     /// </example>
     /// </remarks>
     [Experimental("ASPIRECSHARPAPPS001", UrlFormat = "https://aka.ms/aspire/diagnostics/{0}")]
-    [AspireExportIgnore(Reason = "Polyglot app hosts use the internal addCSharpApp dispatcher export.")]
+    [AspireExportIgnore(Reason = "Polyglot AppHosts use the internal addCSharpApp dispatcher export.")]
     public static IResourceBuilder<CSharpAppResource> AddCSharpApp(this IDistributedApplicationBuilder builder, [ResourceName] string name, string path, Action<ProjectResourceOptions> configure)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -419,10 +418,9 @@ public static class ProjectResourceBuilderExtensions
 
         var resource = builder.AddResource(app)
                               .WithAnnotation(projectMetadata)
-                              .WithDebugSupport(mode => new ProjectLaunchConfiguration { ProjectPath = projectMetadata.ProjectPath, Mode = mode }, "project")
                               .WithProjectDefaults(options);
 
-        resource.OnBeforeResourceStarted(async (r, e, ct) =>
+        resource.OnBeforeResourceStarted((r, e, ct) =>
         {
             var projectPath = projectMetadata.ProjectPath;
 
@@ -436,17 +434,7 @@ public static class ProjectResourceBuilderExtensions
                 throw new DistributedApplicationException(message);
             }
 
-            // Validate .NET version
-            if (((IProjectMetadata)projectMetadata).IsFileBasedApp
-                && await DotnetSdkUtils.TryGetVersionAsync(Path.GetDirectoryName(projectPath)).ConfigureAwait(false) is { } version
-                && version.Major < 10)
-            {
-                // File-based apps are only supported on .NET 10 or later
-                var versionValue = version is not null
-                    ? $"is {version}"
-                    : "could not be determined";
-                throw new DistributedApplicationException($"File-based apps are only supported on .NET 10 or later. The version active in '{Path.GetDirectoryName(projectPath)}' {versionValue}.");
-            }
+            return Task.CompletedTask;
         });
 
         return resource;
@@ -462,9 +450,104 @@ public static class ProjectResourceBuilderExtensions
         target.ExcludeKestrelEndpoints = source.ExcludeKestrelEndpoints;
     }
 
-    internal static IResourceBuilder<TProjectResource> WithProjectDefaults<TProjectResource>(this IResourceBuilder<TProjectResource> builder, ProjectResourceOptions options)
-        where TProjectResource : class, IProjectLaunchDefaultsResource
+    /// <summary>
+    /// Applies the standard .NET launch defaults to a resource that is started through the .NET SDK.
+    /// </summary>
+    /// <typeparam name="TProjectResource">The resource type.</typeparam>
+    /// <param name="builder">The resource builder.</param>
+    /// <param name="options">Options controlling launch profile and Kestrel endpoint handling.</param>
+    /// <returns>The resource builder.</returns>
+    /// <exception cref="InvalidOperationException">The resource does not carry exactly one <see cref="IProjectMetadata"/> annotation, project metadata changes after defaults are applied, or defaults were already applied.</exception>
+    /// <remarks>
+    /// <para>
+    /// This is the wiring shared by every .NET-launched resource: OpenTelemetry exporter configuration,
+    /// launch profile selection and materialization, endpoints derived from launch profile and Kestrel
+    /// configuration, <c>ASPNETCORE_URLS</c> / <c>HTTP_PORTS</c> / <c>HTTPS_PORTS</c> and
+    /// <c>Kestrel__Endpoints__*__Url</c> environment overrides, and (in run mode) the hidden rebuilder
+    /// resource behind the Rebuild command.
+    /// </para>
+    /// <para>
+    /// For TLS-enabled endpoints, an available HTTPS certificate is mapped to Kestrel's default certificate
+    /// unless the resource environment already contains <c>Kestrel__Certificates__Default__Path</c>,
+    /// <c>Kestrel__Certificates__Default__KeyPath</c>, or <c>Kestrel__Certificates__Default__Subject</c>.
+    /// These names are matched case-insensitively. The presence of any of them preserves the existing
+    /// certificate configuration, including its password. Settings supplied by earlier HTTPS certificate
+    /// callbacks participate in this check.
+    /// </para>
+    /// <para>
+    /// A password alone does not suppress the default PFX configuration. It is replaced by the selected
+    /// certificate's password, or removed when that certificate has no password. Certificate settings
+    /// loaded separately by the resource application, such as from <c>appsettings.json</c>, are not checked.
+    /// </para>
+    /// <para>
+    /// The resource must carry <see cref="IProjectMetadata"/>. It is intended for language integration
+    /// packages that add their own .NET resource type, such as <c>Aspire.Hosting.Dotnet</c>; use
+    /// <see cref="AddProject{TProject}(IDistributedApplicationBuilder, string)"/> for ordinary projects.
+    /// </para>
+    /// <para>
+    /// The project metadata annotation must not be added, removed, or replaced after this method returns.
+    /// Aspire validates this before the distributed application starts or publishes.
+    /// </para>
+    /// </remarks>
+    [Experimental("ASPIREPROJECTS001", UrlFormat = "https://aka.ms/aspire/diagnostics/{0}")]
+    [AspireExportIgnore(Reason = "Project launch defaults are applied by the .NET language integration, not by polyglot AppHosts.")]
+    public static IResourceBuilder<TProjectResource> WithProjectDefaults<TProjectResource>(this IResourceBuilder<TProjectResource> builder, ProjectResourceOptions options)
+        where TProjectResource : class, IResourceWithEnvironment, IResourceWithEndpoints, IResourceWithArgs
     {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(options);
+
+        var projectMetadata = builder.Resource.GetProjectMetadata();
+
+        // Carries the per-endpoint state the wiring below needs, and marks the resource as
+        // ".NET-launched" for core features such as the Rebuild command.
+        if (!builder.Resource.TryGetLastAnnotation<ProjectLaunchDefaultsAnnotation>(out var launchDefaults))
+        {
+            launchDefaults = new ProjectLaunchDefaultsAnnotation();
+            builder.WithAnnotation(launchDefaults);
+        }
+
+        // Applying the defaults twice is rejected rather than ignored because most of the settings and infrastructure
+        // added below are not idempotent.
+        if (!launchDefaults.TrySetAppliedProjectMetadata(projectMetadata))
+        {
+            throw new InvalidOperationException(
+                $"Project defaults have already been applied to resource '{builder.Resource.Name}'. " +
+                $"{nameof(WithProjectDefaults)} can only be called once per resource, and {nameof(AddProject)}, " +
+                $"{nameof(AddCSharpApp)} and AddDotnetProject already call it. " +
+                $"Pass {nameof(ProjectResourceOptions)} to the method that adds the resource instead.");
+        }
+
+        launchDefaults.BuildConfiguration =
+            builder.ApplicationBuilder.AppHostAssembly?.GetCustomAttribute<AssemblyConfigurationAttribute>()?.Configuration;
+
+        var launchConfigurationType = ProjectLaunchConfigurationFactory.GetLaunchConfigurationType(
+            builder.Resource,
+            projectMetadata);
+        builder.WithDebugSupport(
+            mode => ProjectLaunchConfigurationFactory.Create(builder.Resource, mode),
+            launchConfigurationType);
+
+        // File-based apps (a bare .cs file) are a .NET 10 SDK feature. The check lives here rather than in
+        // each Add* method so every .NET-launched resource gets it, and it is deferred to start time because
+        // resolving the SDK version shells out to `dotnet --version`.
+        builder.OnBeforeResourceStarted(async (r, e, ct) =>
+        {
+            var currentProjectMetadata = r.GetProjectMetadata();
+            if (!currentProjectMetadata.IsFileBasedApp)
+            {
+                return;
+            }
+
+            var projectDirectory = Path.GetDirectoryName(currentProjectMetadata.ProjectPath);
+            var versionProvider = e.Services.GetRequiredService<IDotnetSdkVersionProvider>();
+            if (await versionProvider.TryGetVersionAsync(projectDirectory, ct).ConfigureAwait(false) is { } version &&
+                version.Major < 10)
+            {
+                throw new DistributedApplicationException($"File-based apps are only supported on .NET 10 or later. The version active in '{projectDirectory}' is {version}.");
+            }
+        });
+
         // .NET SDK has experimental support for retries. Enable with env var.
         // https://github.com/open-telemetry/opentelemetry-dotnet/pull/5495
         // Remove once retry feature in opentelemetry-dotnet is enabled by default.
@@ -478,7 +561,13 @@ public static class ProjectResourceBuilderExtensions
             builder.WithEnvironment(KnownOtelConfigNames.DotnetExperimentalHttpClientDisableUrlQueryRedaction, "true");
         }
 
-        builder.WithOtlpExporter();
+        // The dashboard generates telemetry while processing received telemetry, so automatically exporting
+        // that telemetry back to the dashboard would create a loop. Dashboard telemetry export is opt-in.
+        if (!string.Equals(builder.Resource.Name, KnownResourceNames.AspireDashboard, StringComparisons.ResourceName))
+        {
+            builder.WithOtlpExporter();
+        }
+
         builder.ConfigureConsoleLogs();
 
         if (OperatingSystem.IsWindows())
@@ -508,6 +597,17 @@ public static class ProjectResourceBuilderExtensions
                 return Task.CompletedTask;
             }
 
+            // Preserve an explicit certificate selection as a group. Replacing a PEM Path with a PFX
+            // path while retaining KeyPath makes Kestrel load incompatible files.
+            // https://github.com/microsoft/aspire/issues/20019
+            if (ctx.EnvironmentVariables.Keys.Any(name =>
+                string.Equals(name, KnownAspNetCoreConfigNames.KestrelCertificatesDefaultPath, StringComparisons.EnvironmentVariableName) ||
+                string.Equals(name, KnownAspNetCoreConfigNames.KestrelCertificatesDefaultKeyPath, StringComparisons.EnvironmentVariableName) ||
+                string.Equals(name, KnownAspNetCoreConfigNames.KestrelCertificatesDefaultSubject, StringComparisons.EnvironmentVariableName)))
+            {
+                return Task.CompletedTask;
+            }
+
             // Kestrel's default certificate configuration accepts PFX paths directly. This avoids
             // PEM key-pair path handling differences in local development environments.
             ctx.EnvironmentVariables[KnownAspNetCoreConfigNames.KestrelCertificatesDefaultPath] = ctx.PfxPath;
@@ -528,7 +628,7 @@ public static class ProjectResourceBuilderExtensions
         // In run mode, create a hidden rebuilder resource for this project.
         if (builder.ApplicationBuilder.ExecutionContext.IsRunMode)
         {
-            AddRebuilderResource(builder, projectResource);
+            AddRebuilderResource(builder, projectResource, launchDefaults);
         }
 
         if (builder.ApplicationBuilder.ExecutionContext.IsPublishMode)
@@ -623,14 +723,14 @@ public static class ProjectResourceBuilderExtensions
 
                     adjustTransport(e, endpoint.Protocols);
                     // Keep track of the host separately since EndpointAnnotation doesn't have a host property
-                    builder.Resource.KestrelEndpointAnnotationHosts[e] = e.TargetHost;
+                    launchDefaults.KestrelEndpointAnnotationHosts[e] = e.TargetHost;
                 },
                 createIfNotExists: true);
             }
         }
 
         // Use environment variables to override endpoints if there is a Kestrel config
-        builder.SetKestrelUrlOverrideEnvVariables();
+        builder.SetKestrelUrlOverrideEnvVariables(launchDefaults);
 
         if (builder.ApplicationBuilder.ExecutionContext.IsRunMode)
         {
@@ -741,7 +841,7 @@ public static class ProjectResourceBuilderExtensions
             //   This is because launch profile endpoints are not meant to be used in production.
             if (!kestrelEndpointsByScheme.Any())
             {
-                builder.SetBothPortsEnvVariables();
+                builder.SetBothPortsEnvVariables(launchDefaults);
             }
 
             // If we aren't a web project (looking at both launch profile and Kestrel config) we don't automatically add bindings.
@@ -768,7 +868,7 @@ public static class ProjectResourceBuilderExtensions
                         // Keep track of the default https endpoint so we can exclude it from HTTPS_PORTS & Kestrel env vars
                         if (scheme == "https")
                         {
-                            builder.Resource.DefaultHttpsEndpoint = e;
+                            launchDefaults.DefaultHttpsEndpoint = e;
                         }
                     },
                     createIfNotExists: true);
@@ -955,9 +1055,9 @@ public static class ProjectResourceBuilderExtensions
             context.WriteContainerAsync(container));
     }
 
-    private static IConfiguration GetConfiguration(IProjectLaunchDefaultsResource projectResource)
+    private static IConfiguration GetConfiguration(IResource projectResource)
     {
-        var projectMetadata = projectResource.Annotations.OfType<IProjectMetadata>().Single();
+        var projectMetadata = projectResource.GetProjectMetadata();
 
         // For testing
         if (projectMetadata.Configuration is { } configuration)
@@ -985,22 +1085,30 @@ public static class ProjectResourceBuilderExtensions
     /// <summary>
     /// Creates a hidden rebuilder resource that runs 'dotnet build' on demand via the rebuild command.
     /// </summary>
-    private static void AddRebuilderResource<TProjectResource>(IResourceBuilder<TProjectResource> builder, TProjectResource projectResource)
-        where TProjectResource : class, IProjectLaunchDefaultsResource
+    private static void AddRebuilderResource<TProjectResource>(
+        IResourceBuilder<TProjectResource> builder,
+        TProjectResource projectResource,
+        ProjectLaunchDefaultsAnnotation launchDefaults)
+        where TProjectResource : class, IResource
     {
-        var projectMetadata = projectResource.Annotations.OfType<IProjectMetadata>().SingleOrDefault();
-        if (projectMetadata is null || projectMetadata.IsFileBasedApp)
-        {
-            return;
-        }
-
+        var projectMetadata = projectResource.GetProjectMetadata();
         var rebuilderName = $"{projectResource.Name}-rebuilder";
         var rebuilder = new ProjectRebuilderResource(rebuilderName, projectResource, projectMetadata.ProjectPath);
         rebuilder.Annotations.Add(NameValidationPolicyAnnotation.None);
         var rebuilderBuilder = builder.ApplicationBuilder.AddResource(rebuilder);
 
         rebuilderBuilder
-            .WithArgs("build", projectMetadata.ProjectPath)
+            .WithArgs(context =>
+            {
+                context.Args.Add("build");
+                context.Args.Add(projectMetadata.ProjectPath);
+
+                if (!string.IsNullOrEmpty(launchDefaults.BuildConfiguration))
+                {
+                    context.Args.Add("--configuration");
+                    context.Args.Add(launchDefaults.BuildConfiguration);
+                }
+            })
             .WithAnnotation(new ExplicitStartupAnnotation())
             .WithAnnotation(new ExcludeLifecycleCommandsAnnotation())
             .ExcludeFromManifest()
@@ -1014,7 +1122,7 @@ public static class ProjectResourceBuilderExtensions
     }
 
     private static void SetAspNetCoreUrls<T>(this IResourceBuilder<T> builder)
-        where T : IProjectLaunchDefaultsResource
+        where T : IResourceWithEnvironment, IResourceWithEndpoints
     {
         builder.WithEnvironment(context =>
         {
@@ -1058,18 +1166,18 @@ public static class ProjectResourceBuilderExtensions
         });
     }
 
-    private static void SetBothPortsEnvVariables<T>(this IResourceBuilder<T> builder)
-        where T : IProjectLaunchDefaultsResource
+    private static void SetBothPortsEnvVariables<T>(this IResourceBuilder<T> builder, ProjectLaunchDefaultsAnnotation launchDefaults)
+        where T : IResourceWithEnvironment, IResourceWithEndpoints
     {
         builder.WithEnvironment(context =>
         {
-            builder.SetOnePortsEnvVariable(context, "HTTP_PORTS", "http");
-            builder.SetOnePortsEnvVariable(context, "HTTPS_PORTS", "https");
+            builder.SetOnePortsEnvVariable(context, launchDefaults, "HTTP_PORTS", "http");
+            builder.SetOnePortsEnvVariable(context, launchDefaults, "HTTPS_PORTS", "https");
         });
     }
 
-    private static void SetOnePortsEnvVariable<T>(this IResourceBuilder<T> builder, EnvironmentCallbackContext context, string portEnvVariable, string scheme)
-        where T : IProjectLaunchDefaultsResource
+    private static void SetOnePortsEnvVariable<T>(this IResourceBuilder<T> builder, EnvironmentCallbackContext context, ProjectLaunchDefaultsAnnotation launchDefaults, string portEnvVariable, string scheme)
+        where T : IResourceWithEnvironment, IResourceWithEndpoints
     {
         if (context.EnvironmentVariables.ContainsKey(portEnvVariable))
         {
@@ -1084,7 +1192,7 @@ public static class ProjectResourceBuilderExtensions
         foreach (var e in builder.Resource.GetEndpoints().Where(builder.Resource.ShouldInjectEndpointEnvironment))
         {
             // Skip the default https endpoint because the container likely won't be set up to listen on https (e.g. ACA case)
-            if (e.EndpointAnnotation.UriScheme == scheme && e.EndpointAnnotation != builder.Resource.DefaultHttpsEndpoint)
+            if (e.EndpointAnnotation.UriScheme == scheme && e.EndpointAnnotation != launchDefaults.DefaultHttpsEndpoint)
             {
                 Debug.Assert(!e.EndpointAnnotation.FromLaunchProfile, "Endpoints from launch profile should never make it here");
 
@@ -1104,19 +1212,19 @@ public static class ProjectResourceBuilderExtensions
         }
     }
 
-    private static void SetKestrelUrlOverrideEnvVariables<T>(this IResourceBuilder<T> builder)
-        where T : IProjectLaunchDefaultsResource
+    private static void SetKestrelUrlOverrideEnvVariables<T>(this IResourceBuilder<T> builder, ProjectLaunchDefaultsAnnotation launchDefaults)
+        where T : IResourceWithEnvironment, IResourceWithEndpoints
     {
         builder.WithEnvironment(context =>
         {
             // If there are any Kestrel endpoints, we need to override all endpoints, even if they
             // don't come from Kestrel. This is because having Kestrel endpoints overrides everything
-            if (builder.Resource.HasKestrelEndpoints)
+            if (launchDefaults.HasKestrelEndpoints)
             {
                 foreach (var e in builder.Resource.GetEndpoints().Where(builder.Resource.ShouldInjectEndpointEnvironment))
                 {
                     // Skip the default https endpoint because the container likely won't be set up to listen on https (e.g. ACA case)
-                    if (e.EndpointAnnotation == builder.Resource.DefaultHttpsEndpoint)
+                    if (e.EndpointAnnotation == launchDefaults.DefaultHttpsEndpoint)
                     {
                         continue;
                     }
@@ -1124,7 +1232,7 @@ public static class ProjectResourceBuilderExtensions
                     // In Run mode, we keep the original Kestrel config host.
                     // In Publish mode, we always use *, so it can work in a container (where localhost wouldn't work).
                     var host = builder.ApplicationBuilder.ExecutionContext.IsRunMode &&
-                        builder.Resource.KestrelEndpointAnnotationHosts.TryGetValue(e.EndpointAnnotation, out var kestrelHost) ? kestrelHost : "*";
+                        launchDefaults.KestrelEndpointAnnotationHosts.TryGetValue(e.EndpointAnnotation, out var kestrelHost) ? kestrelHost : "*";
 
                     var url = ReferenceExpression.Create($"{e.EndpointAnnotation.UriScheme}://{host}:{e.Property(EndpointProperty.TargetPort)}");
 

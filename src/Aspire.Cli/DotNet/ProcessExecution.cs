@@ -1,16 +1,18 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using Aspire.Cli.Processes;
 using Microsoft.Extensions.Logging;
 
 namespace Aspire.Cli.DotNet;
 
 /// <summary>
-/// The single <see cref="IProcessExecution"/> implementation. Wraps an <see cref="IsolatedProcess"/>
-/// for isolated-console, kill-on-parent-exit, and ordinary redirected subprocesses. The child is
-/// spawned lazily on <see cref="Start"/> so callers that build an execution but never start it (e.g.
+/// The single <see cref="IProcessExecution"/> implementation. Wraps a <see cref="Process"/> for
+/// isolated-console, kill-on-parent-exit, detached, and ordinary redirected subprocesses. The child is
+/// spawned lazily on <see cref="IProcessExecution.StartAsync"/> so callers that build an execution but never start it (e.g.
 /// the extension-host launch path, which reads <see cref="Arguments"/> /
 /// <see cref="EnvironmentVariables"/> and returns before starting) don't orphan a process.
 /// </summary>
@@ -19,46 +21,50 @@ internal sealed class ProcessExecution : IProcessExecution
     private static readonly TimeSpan s_drainIdleTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan s_drainPollInterval = TimeSpan.FromMilliseconds(100);
 
-    private readonly IsolatedProcessStartInfo _startInfo;
-    private readonly string _fileName;
-    private readonly IReadOnlyList<string> _arguments;
-    private readonly IReadOnlyDictionary<string, string?> _environment;
+    private readonly ProcessStartInfo _startInfo;
     private readonly ILogger _logger;
     private readonly ProcessInvocationOptions _options;
     private readonly IEnvironment _hostEnvironment;
-    private IsolatedProcess? _process;
+    private readonly Lock _lifecycleLock = new();
+    private Process? _process;
+    private int _processId;
+    private DateTimeOffset? _startTime;
+    private Task _outputDrained = Task.CompletedTask;
+    private bool _disposed;
     private long _lastActivityTimestamp = Stopwatch.GetTimestamp();
-    private int _disposed;
 
     internal ProcessExecution(
-        IsolatedProcessStartInfo startInfo,
-        string fileName,
-        IReadOnlyList<string> arguments,
-        IReadOnlyDictionary<string, string?> environment,
+        ProcessStartInfo startInfo,
         ILogger logger,
         ProcessInvocationOptions options,
         IEnvironment hostEnvironment)
     {
         _startInfo = startInfo;
-        _fileName = fileName;
-        _arguments = arguments;
-        _environment = environment;
         _logger = logger;
         _options = options;
         _hostEnvironment = hostEnvironment;
+        EnvironmentVariables = new ReadOnlyDictionary<string, string?>(startInfo.Environment);
     }
 
     /// <inheritdoc />
-    public string FileName => _fileName;
+    public string FileName => _startInfo.FileName;
 
     /// <inheritdoc />
-    public IReadOnlyList<string> Arguments => _arguments;
+    public IReadOnlyList<string> Arguments => _startInfo.ArgumentList;
 
     /// <inheritdoc />
-    public IReadOnlyDictionary<string, string?> EnvironmentVariables => _environment;
+    public IReadOnlyDictionary<string, string?> EnvironmentVariables { get; }
 
     /// <inheritdoc />
-    public int ProcessId => Process.Id;
+    public int ProcessId
+    {
+        get
+        {
+            // Captured at spawn because Process.Id throws once the handle is disposed.
+            _ = Process;
+            return _processId;
+        }
+    }
 
     /// <inheritdoc />
     public bool HasExited => Process.HasExited;
@@ -66,26 +72,130 @@ internal sealed class ProcessExecution : IProcessExecution
     /// <inheritdoc />
     public int ExitCode => Process.ExitCode;
 
-    private IsolatedProcess Process =>
-        _process ?? throw new InvalidOperationException($"{nameof(ProcessExecution)} has not been started. Call {nameof(Start)} first.");
+    /// <inheritdoc />
+    public DateTimeOffset? StartTime
+    {
+        get
+        {
+            _ = Process;
+            return _startTime;
+        }
+    }
+
+    private Process Process =>
+        Volatile.Read(ref _process)
+        ?? throw new InvalidOperationException($"{nameof(ProcessExecution)} has not been started. Call {nameof(StartAsync)} first.");
 
     /// <inheritdoc />
-    public bool Start()
+    public Task<bool> StartAsync(CancellationToken cancellationToken)
     {
-        // IsolatedProcess.Start spawns the child and starts the stdout/stderr pumps. It throws on
-        // spawn failure (matching the old ProcessExecution, whose Process.Start could also throw),
-        // so a successful return always means the child is running — there is no false-on-failure
-        // case to model. The old Process.Start() == false path was dead for UseShellExecute=false.
-        _process = IsolatedProcess.Start(_startInfo, OnOutputLine, OnErrorLine);
-        _logger.LogDebug("{FileName}({ProcessId}) started in {WorkingDirectory}", _fileName, _process.Id, _startInfo.WorkingDirectory);
-        return true;
+        cancellationToken.ThrowIfCancellationRequested();
+
+        Process process;
+        lock (_lifecycleLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_process is not null)
+            {
+                throw new InvalidOperationException($"{nameof(ProcessExecution)} has already been started.");
+            }
+
+            // Children never consume input from the CLI. A null stdin makes tools such as
+            // package-manager lifecycle scripts observe EOF instead of inheriting the TTY and blocking
+            // indefinitely (https://github.com/microsoft/aspire/issues/16791). A detached child
+            // outlives the CLI, so nothing would be left to drain redirected output either.
+            using var nullHandle = File.OpenNullHandle();
+            _startInfo.StandardInputHandle = nullHandle;
+            if (_options.Detached)
+            {
+                _startInfo.StandardOutputHandle = nullHandle;
+                _startInfo.StandardErrorHandle = nullHandle;
+            }
+
+            // Process.Start() only returns null for UseShellExecute, which is never used here.
+            process = Process.Start(_startInfo)
+                ?? throw new InvalidOperationException($"Failed to start child process: {_startInfo.FileName}");
+            _processId = process.Id;
+            _startTime = GetStartTime(process);
+            Volatile.Write(ref _process, process);
+
+            // Publish the process before reading output so callbacks can read ProcessId.
+            if (!_options.Detached)
+            {
+                _outputDrained = Task.Run(() => ReadOutputAsync(process), CancellationToken.None);
+            }
+        }
+
+        _logger.LogDebug("{FileName}({ProcessId}) started in {WorkingDirectory}", FileName, _processId, _startInfo.WorkingDirectory);
+        return Task.FromResult(true);
+    }
+
+    private static DateTimeOffset? GetStartTime(Process process)
+    {
+        try
+        {
+            return ProcessStartTimeHelper.TryGetProcessStartTime(process.Id) ?? new DateTimeOffset(process.StartTime);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            // The child already exited and was reaped.
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Forwards each output line to the callbacks until both pipes reach EOF.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Process.ReadAllLinesAsync"/> reads the pipes directly, unlike
+    /// <see cref="Process.BeginOutputReadLine"/>, so <see cref="Process.WaitForExitAsync"/> does not
+    /// also wait for EOF, which a grandchild holding the inherited pipe (e.g. a build server) can
+    /// delay indefinitely. <see cref="DrainOutputAsync"/> bounds the wait for EOF instead.
+    /// </remarks>
+    private async Task ReadOutputAsync(Process process)
+    {
+        Exception? firstCallbackException = null;
+        try
+        {
+            await foreach (var line in process.ReadAllLinesAsync(CancellationToken.None).ConfigureAwait(false))
+            {
+                try
+                {
+                    if (line.StandardError)
+                    {
+                        OnErrorLine(line.Content);
+                    }
+                    else
+                    {
+                        OnOutputLine(line.Content);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Keep draining so a throwing callback cannot back-pressure the child through a
+                    // full pipe. The first failure is surfaced after EOF.
+                    firstCallbackException ??= ex;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            // DisposeAsync released the pipes while a read was pending (no token is passed, so a
+            // cancellation can only come from that). Treat as EOF.
+            return;
+        }
+
+        if (firstCallbackException is not null)
+        {
+            ExceptionDispatchInfo.Throw(firstCallbackException);
+        }
     }
 
     /// <inheritdoc />
     public async Task<int> WaitForExitAsync(CancellationToken cancellationToken)
     {
         var process = Process;
-        _logger.LogDebug("{FileName}({ProcessId}) waiting for exit", _fileName, process.Id);
+        _logger.LogDebug("{FileName}({ProcessId}) waiting for exit", FileName, _processId);
 
         try
         {
@@ -93,9 +203,9 @@ internal sealed class ProcessExecution : IProcessExecution
         }
         catch (OperationCanceledException)
         {
-            _logger.LogDebug("{FileName}({ProcessId}) wait was canceled, stopping it", _fileName, process.Id);
+            _logger.LogDebug("{FileName}({ProcessId}) wait was canceled, stopping it", FileName, _processId);
 
-            await ShutdownOnCancelAsync(process.Process).ConfigureAwait(false);
+            await ShutdownOnCancelAsync(process).ConfigureAwait(false);
 
             // The child has now been signalled/killed by the coordinator. Drain trailing stdout/stderr
             // before propagating the cancellation so callers that observe output — or that swallow the
@@ -103,19 +213,19 @@ internal sealed class ProcessExecution : IProcessExecution
             // teardown) — still get the full tail. Use a detached token + reset idle window so the drain
             // gets its whole budget even though the caller's token is already cancelled.
             RecordActivity();
-            await DrainOutputAsync(process, CancellationToken.None).ConfigureAwait(false);
+            await DrainOutputAsync(CancellationToken.None).ConfigureAwait(false);
 
             throw;
         }
 
-        _logger.LogDebug("{FileName}({ProcessId}) exited with code: {ExitCode}", _fileName, process.Id, process.ExitCode);
+        _logger.LogDebug("{FileName}({ProcessId}) exited with code: {ExitCode}", FileName, _processId, process.ExitCode);
 
         // Reset the idle window at exit so the drain budget is measured from "process gone", not
         // from the last line read. A consumer can block in a callback right up to exit and still
         // get the full tail — see
         // ProcessExecutionTests.WaitForExitAsync_AllowsBufferedTailOutputAfterLongIdlePeriod.
         RecordActivity();
-        await DrainOutputAsync(process, cancellationToken).ConfigureAwait(false);
+        await DrainOutputAsync(cancellationToken).ConfigureAwait(false);
 
         return process.ExitCode;
     }
@@ -217,7 +327,7 @@ internal sealed class ProcessExecution : IProcessExecution
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to kill {FileName} (pid {Pid}).", _fileName, GetSafePid(process));
+                _logger.LogWarning(ex, "Failed to kill {FileName} (pid {Pid}).", FileName, GetSafePid(process));
                 return;
             }
 
@@ -235,7 +345,7 @@ internal sealed class ProcessExecution : IProcessExecution
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Error draining killed {FileName} (pid {Pid}).", _fileName, GetSafePid(process));
+                _logger.LogWarning(ex, "Error draining killed {FileName} (pid {Pid}).", FileName, GetSafePid(process));
             }
         }
         finally
@@ -272,7 +382,7 @@ internal sealed class ProcessExecution : IProcessExecution
         {
             if (process.HasExited)
             {
-                _logger.LogDebug("{FileName} process {ProcessId} already exited.", _fileName, process.Id);
+                _logger.LogDebug("{FileName} process {ProcessId} already exited.", FileName, process.Id);
                 return;
             }
 
@@ -288,7 +398,7 @@ internal sealed class ProcessExecution : IProcessExecution
 
             _logger.LogDebug(
                 "Sending kill to {FileName} process {ProcessId} (entireProcessTree={EntireProcessTree}).",
-                _fileName,
+                FileName,
                 process.Id,
                 entireProcessTree);
             process.Kill(entireProcessTree);
@@ -298,7 +408,7 @@ internal sealed class ProcessExecution : IProcessExecution
             _logger.LogDebug(
                 ex,
                 "{FileName} process exited before termination could complete (entireProcessTree={EntireProcessTree}).",
-                _fileName,
+                FileName,
                 entireProcessTree);
         }
         catch (Exception ex)
@@ -306,7 +416,7 @@ internal sealed class ProcessExecution : IProcessExecution
             _logger.LogDebug(
                 ex,
                 "Failed to terminate {FileName} process (entireProcessTree={EntireProcessTree}).",
-                _fileName,
+                FileName,
                 entireProcessTree);
         }
     }
@@ -337,7 +447,7 @@ internal sealed class ProcessExecution : IProcessExecution
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to issue graceful shutdown to {FileName} (pid {Pid}); escalating to kill.", _fileName, pid);
+            _logger.LogWarning(ex, "Failed to issue graceful shutdown to {FileName} (pid {Pid}); escalating to kill.", FileName, pid);
         }
     }
 
@@ -359,29 +469,34 @@ internal sealed class ProcessExecution : IProcessExecution
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        Process? process;
+        lock (_lifecycleLock)
         {
-            return;
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            process = _process;
         }
 
-        // IsolatedProcess exposes only DisposeAsync — it drains the pumps then tears the
-        // pipes/handles down. DotNetCliRunner does not dispose the execution (StartBackchannelAsync
-        // runs fire-and-forget and reads HasExited/ExitCode after the await — see DotNetCliRunner.cs),
-        // so this path is reached only by explicit `await using` consumers (the session, guest
-        // launcher) and tests.
-        var process = _process;
         if (process is null)
         {
             return;
         }
 
+        // DotNetCliRunner does not dispose the execution (StartBackchannelAsync runs fire-and-forget
+        // and reads HasExited/ExitCode after the await — see DotNetCliRunner.cs), so this path is
+        // reached only by explicit `await using` consumers (the session, guest launcher) and tests.
+        //
         // Terminate the child if it is still running. On the normal teardown paths the caller drives
         // WaitForExitAsync(token) first, so the shutdown ladder has already exited or killed the
         // process by the time we get here and this is a no-op. It matters for the path where an
         // execution was started but never driven (e.g. a fault between Start and the caller wiring up
-        // its wait loop): IsolatedProcess.DisposeAsync only drains pumps and releases handles — it
-        // does NOT terminate the process — so without this kill the child would be orphaned. Owning
-        // "kill if still alive on dispose" here keeps that responsibility off every consumer.
+        // its wait loop): Process.Dispose releases handles but does NOT terminate the process — so
+        // without this kill the child would be orphaned. Owning "kill if still alive on dispose" here
+        // keeps that responsibility off every consumer.
         try
         {
             if (!process.HasExited)
@@ -395,43 +510,37 @@ internal sealed class ProcessExecution : IProcessExecution
             // unkillable. The drain/handle release below still runs.
         }
 
-        try
-        {
-            await process.DisposeAsync().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "{FileName} IsolatedProcess dispose threw", _fileName);
-        }
+        await DrainOutputAsync(CancellationToken.None).ConfigureAwait(false);
+        process.Dispose();
     }
 
-    private void OnOutputLine(IsolatedProcess sender, string line)
+    private void OnOutputLine(string line)
     {
-        // RecordActivity brackets the callback (matching the old forwarder) so a slow consumer
+        // RecordActivity brackets the callback so a slow consumer
         // keeps the drain budget alive both while we hand it the line and while it processes it.
         RecordActivity();
         if (_logger.IsEnabled(LogLevel.Trace))
         {
-            _logger.LogTrace("{FileName}({ProcessId}) stdout: {Line}", _fileName, sender.Id, line);
+            _logger.LogTrace("{FileName}({ProcessId}) stdout: {Line}", FileName, _processId, line);
         }
         _options.StandardOutputCallback?.Invoke(line);
         RecordActivity();
     }
 
-    private void OnErrorLine(IsolatedProcess sender, string line)
+    private void OnErrorLine(string line)
     {
         RecordActivity();
         if (_logger.IsEnabled(LogLevel.Trace))
         {
-            _logger.LogTrace("{FileName}({ProcessId}) stderr: {Line}", _fileName, sender.Id, line);
+            _logger.LogTrace("{FileName}({ProcessId}) stderr: {Line}", FileName, _processId, line);
         }
         _options.StandardErrorCallback?.Invoke(line);
         RecordActivity();
     }
 
-    private async Task DrainOutputAsync(IsolatedProcess process, CancellationToken cancellationToken)
+    private async Task DrainOutputAsync(CancellationToken cancellationToken)
     {
-        var drained = Task.WhenAll(process.StandardOutputClosed, process.StandardErrorClosed);
+        var drained = _outputDrained;
 
         while (true)
         {
@@ -443,22 +552,22 @@ internal sealed class ProcessExecution : IProcessExecution
                 }
                 catch (Exception ex)
                 {
-                    // A throwing callback faults the pump task and surfaces here. The pumps still
+                    // A throwing callback faults the reader task and surfaces here. The reader still
                     // drained to EOF so output isn't lost; log and move on — the exit code is valid.
-                    _logger.LogWarning(ex, "{FileName}({ProcessId}) stdout/stderr pump faulted while draining after exit", _fileName, process.Id);
+                    _logger.LogWarning(ex, "{FileName}({ProcessId}) stdout/stderr callback faulted while draining after exit", FileName, _processId);
                 }
 
-                _logger.LogDebug("{FileName}({ProcessId}) output drained", _fileName, process.Id);
+                _logger.LogDebug("{FileName}({ProcessId}) output drained", FileName, _processId);
                 return;
             }
 
             // Idle-based budget: a slow-but-progressing consumer keeps resetting the timer via
-            // RecordActivity, so only a genuinely stalled pump (no output for the whole window)
-            // gives up. The pumps keep running in the background and are reaped by DisposeAsync —
-            // we never force the streams closed (that's the isolated path's already-accepted shape).
+            // RecordActivity, so only a genuinely stalled reader (no output for the whole window)
+            // gives up. The reader keeps running in the background until DisposeAsync releases the
+            // pipes — this method never closes streams while callbacks may still be processing data.
             if (Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastActivityTimestamp)) >= s_drainIdleTimeout)
             {
-                _logger.LogWarning("{FileName}({ProcessId}) stdout/stderr pumps did not drain within idle timeout after exit", _fileName, process.Id);
+                _logger.LogWarning("{FileName}({ProcessId}) stdout/stderr did not drain within idle timeout after exit", FileName, _processId);
                 return;
             }
 

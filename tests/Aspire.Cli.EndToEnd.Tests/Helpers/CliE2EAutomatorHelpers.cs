@@ -43,9 +43,12 @@ internal static class CliE2EAutomatorHelpers
     /// Builds the shell command that launches <c>aspire run</c> with an explicit AppHost startup budget so cold
     /// daily-feed restores don't trip the CLI's default 120s startup timeout. See <see cref="AspireRunStartupBudgetSeconds"/>.
     /// </summary>
-    internal static string GetAspireRunCommand()
+    /// <param name="additionalArguments">Extra arguments appended after <c>aspire run</c>, for example <c>--apphost &lt;path&gt;</c>.</param>
+    internal static string GetAspireRunCommand(string? additionalArguments = null)
     {
-        return $"ASPIRE_CLI_START_TIMEOUT={AspireRunStartupBudgetSeconds.ToString(CultureInfo.InvariantCulture)} aspire run";
+        var command = $"ASPIRE_CLI_START_TIMEOUT={AspireRunStartupBudgetSeconds.ToString(CultureInfo.InvariantCulture)} aspire run";
+
+        return string.IsNullOrEmpty(additionalArguments) ? command : $"{command} {additionalArguments}";
     }
 
     /// <summary>
@@ -86,11 +89,6 @@ internal static class CliE2EAutomatorHelpers
             await auto.RunCommandAsync($"cd {AspireCliShellCommandHelpers.QuoteBashArg(containerWorkspace)}", counter);
 
             await auto.RunCommandAsync($"export ASPIRE_E2E_WORKSPACE={AspireCliShellCommandHelpers.QuoteBashArg(containerWorkspace)}", counter);
-
-            if (!CliE2ETestHelpers.IsRunningInCI && ShouldPreserveLocalWorkspace())
-            {
-                workspace.Preserve();
-            }
 
             if (ShouldCaptureWorkspaceDiagnostics())
             {
@@ -143,6 +141,10 @@ internal static class CliE2EAutomatorHelpers
                     counter,
                     TimeSpan.FromSeconds(120));
                 await auto.SourceAspireBundleEnvironmentAsync(counter);
+                if (strategy.LocalArchiveHiveLabel == "local")
+                {
+                    await auto.ConfigureLocalHiveAsync(counter);
+                }
                 break;
 
             case CliInstallMode.InstallScript:
@@ -433,6 +435,10 @@ internal static class CliE2EAutomatorHelpers
                     counter,
                     TimeSpan.FromSeconds(120));
                 await auto.SourceAspireCliEnvironmentAsync(counter);
+                if (strategy.LocalArchiveHiveLabel == "local")
+                {
+                    await auto.ConfigureLocalHiveAsync(counter);
+                }
                 break;
 
             case CliInstallMode.InstallScript:
@@ -567,11 +573,6 @@ internal static class CliE2EAutomatorHelpers
     {
         await auto.PrepareBashEnvironmentAsync(workspace.WorkspaceRoot.FullName, counter, TimeSpan.FromSeconds(10));
         await auto.RunCommandAsync($"export ASPIRE_E2E_WORKSPACE={AspireCliShellCommandHelpers.QuoteBashArg(workspace.WorkspaceRoot.FullName)}", counter);
-
-        if (!CliE2ETestHelpers.IsRunningInCI && ShouldPreserveLocalWorkspace())
-        {
-            workspace.Preserve();
-        }
 
         if (ShouldCaptureWorkspaceDiagnostics())
         {
@@ -713,7 +714,7 @@ internal static class CliE2EAutomatorHelpers
         this Hex1bTerminalAutomator auto,
         SequenceCounter counter)
     {
-        await auto.TypeAsync("aspire config set features:experimentalPolyglot:java true --global --non-interactive");
+        await auto.TypeAsync("aspire config set features:experimentalPolyglotJava true --global --non-interactive");
         await auto.EnterAsync();
         await auto.WaitForSuccessPromptAsync(counter);
     }
@@ -777,22 +778,32 @@ internal static class CliE2EAutomatorHelpers
 
         // Wait for the command to finish — check for success or error exit.
         var succeeded = false;
-        await auto.WaitUntilAsync(snapshot =>
+        try
         {
-            var successSearcher = new CellPatternSearcher()
-                .FindPattern(expectedCounter.ToString())
-                .RightText(" OK] $ ");
-            if (successSearcher.Search(snapshot).Count > 0)
+            await auto.WaitUntilAsync(snapshot =>
             {
-                succeeded = true;
-                return true;
-            }
+                var successSearcher = new CellPatternSearcher()
+                    .FindPattern(expectedCounter.ToString())
+                    .RightText(" OK] $ ");
+                if (successSearcher.Search(snapshot).Count > 0)
+                {
+                    succeeded = true;
+                    return true;
+                }
 
-            var errorSearcher = new CellPatternSearcher()
-                .FindPattern(expectedCounter.ToString())
-                .RightText(" ERR:");
-            return errorSearcher.Search(snapshot).Count > 0;
-        }, timeout: effectiveTimeout, description: $"aspire start to complete [{expectedCounter} OK/ERR]");
+                var errorSearcher = new CellPatternSearcher()
+                    .FindPattern(expectedCounter.ToString())
+                    .RightText(" ERR:");
+                return errorSearcher.Search(snapshot).Count > 0;
+            }, timeout: effectiveTimeout, description: $"aspire start to complete [{expectedCounter} OK/ERR]");
+        }
+        catch (Hex1bAutomationException ex) when (ex.InnerException is WaitUntilTimeoutException)
+        {
+            throw new TimeoutException(
+                $"aspire start did not complete within {startupTimeoutSeconds} seconds. AppHost startup may be stuck. " +
+                "Check the terminal recording and captured workspace diagnostics for CLI and AppHost logs.",
+                ex);
+        }
 
         counter.Increment();
 
@@ -911,23 +922,50 @@ internal static class CliE2EAutomatorHelpers
                 "Check terminal output for CLI logs and JSON content.");
         }
 
-        // Retry curl up to 10 times with 2s delay — the dashboard may still be binding
-        // its listening port immediately after aspire start returns.
-        await auto.TypeAsync(
-            "for i in $(seq 1 10); do " +
-            "CODE=$(curl -ksSL -o /dev/null -w '%{http_code}' \"$DASHBOARD_URL\" 2>/dev/null); " +
-            "if [ \"$CODE\" = \"200\" ]; then echo 'dashboard-http-200'; break; fi; " +
-            "sleep 2; " +
-            "done; " +
-            "if [ \"$CODE\" != \"200\" ]; then echo \"dashboard-http-${CODE}\"; echo 'dashboard-http-failed'; fi");
-        await auto.EnterAsync();
-        await auto.WaitUntilTextAsync("dashboard-http-200", timeout: TimeSpan.FromSeconds(30));
-        await auto.WaitForSuccessPromptAsync(counter);
+        await auto.WaitForDashboardReadyAsync(counter, TimeSpan.FromSeconds(90));
+    }
+
+    /// <summary>
+    /// Waits for HTTP 200 from the shell's Dashboard URL using bounded requests.
+    /// </summary>
+    internal static async Task WaitForDashboardReadyAsync(this Hex1bTerminalAutomator auto, SequenceCounter counter, TimeSpan timeout)
+    {
+        // Bound each request so a non-responsive Dashboard cannot block the shell and prevent diagnostics capture.
+        // Wait for the command's exit status because the success marker also appears in the echoed command.
+        try
+        {
+            await auto.RunCommandAsync(
+                "for i in $(seq 1 10); do " +
+                "CODE=$(curl -ksSL --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' \"$DASHBOARD_URL\" 2>/dev/null); " +
+                "if [ \"$CODE\" = \"200\" ]; then echo 'dashboard-http-200'; break; fi; " +
+                "sleep 2; " +
+                "done; " +
+                "if [ \"$CODE\" != \"200\" ]; then echo \"dashboard-http-${CODE}\"; echo 'dashboard-http-failed'; fi; " +
+                "test \"$CODE\" = \"200\"",
+                counter,
+                timeout);
+        }
+        catch (Exception ex) when (ex is Hex1bAutomationException { InnerException: WaitUntilTimeoutException } or InvalidOperationException)
+        {
+            throw new TimeoutException(
+                $"aspire start completed, but the Dashboard did not become ready within the {timeout.TotalSeconds.ToString(CultureInfo.InvariantCulture)}-second readiness budget. " +
+                "Expected HTTP 200 from the Dashboard URL. The Dashboard may have failed to start or stopped responding. " +
+                "Check the terminal recording for the last HTTP status and the captured workspace diagnostics for AppHost and Dashboard logs.",
+                ex);
+        }
     }
 
     /// <summary>
     /// Stops a running Aspire AppHost with <c>aspire stop</c>.
     /// </summary>
+    /// <remarks>
+    /// Uses <see cref="Hex1bAutomatorTestHelpers.WaitForSuccessPromptAsync"/> so that a
+    /// non-zero exit from <c>aspire stop</c> (for example the documented <c>FailedToDotnetRunAppHost</c>
+    /// flake in https://github.com/microsoft/aspire/issues/16643) surfaces immediately with a
+    /// useful diagnostic rather than the default 500-second wait for the success prompt. <c>aspire stop</c>
+    /// is invoked at the end of E2E tests on the happy path; any error result is a real failure to
+    /// surface, not something the test should silently sit on.
+    /// </remarks>
     internal static async Task AspireStopAsync(
         this Hex1bTerminalAutomator auto,
         SequenceCounter counter,
@@ -1003,7 +1041,7 @@ internal static class CliE2EAutomatorHelpers
         {
             await auto.TypeAsync("echo diagnostics-available-in-workspace");
             await auto.EnterAsync();
-            await auto.WaitForSuccessPromptAsync(counter);
+            await auto.WaitForSuccessPromptAsync(counter, TimeSpan.FromSeconds(15));
             return;
         }
 
@@ -1011,7 +1049,7 @@ internal static class CliE2EAutomatorHelpers
 
         await auto.TypeAsync(BuildAspireDiagnosticsCaptureCommand(containerWorkspace) + "echo done");
         await auto.EnterAsync();
-        await auto.WaitForSuccessPromptAsync(counter);
+        await auto.WaitForSuccessPromptAsync(counter, TimeSpan.FromSeconds(15));
     }
 
     /// <summary>
@@ -1149,7 +1187,7 @@ internal static class CliE2EAutomatorHelpers
         await auto.WaitForAnyPromptAsync(counter);
     }
 
-    private static bool ShouldPreserveLocalWorkspace()
+    private static bool ShouldCaptureWorkspaceOnFailure()
     {
         return TestContext.Current?.KeyValueStorage.TryGetValue("PreserveWorkspaceOnFailure", out var value) == true &&
             value is true;
@@ -1157,7 +1195,7 @@ internal static class CliE2EAutomatorHelpers
 
     private static bool ShouldCaptureWorkspaceDiagnostics()
     {
-        return CliE2ETestHelpers.IsRunningInCI || ShouldPreserveLocalWorkspace();
+        return CliE2ETestHelpers.IsRunningInCI || ShouldCaptureWorkspaceOnFailure();
     }
 
     private enum AspireNewEmptyAppHostResult

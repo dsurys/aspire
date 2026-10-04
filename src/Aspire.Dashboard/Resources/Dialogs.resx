@@ -223,6 +223,9 @@
   <data name="HelpDialogGoToSettings" xml:space="preserve">
     <value>Go to Settings</value>
   </data>
+  <data name="HelpDialogToggleTerminalDock" xml:space="preserve">
+    <value>Toggle terminal</value>
+  </data>
   <data name="HelpDialogKeyboardShortcutsTitle" xml:space="preserve">
     <value>Keyboard Shortcuts</value>
   </data>
@@ -391,6 +394,9 @@
   <data name="GenAILLMBadgeText" xml:space="preserve">
     <value>LLM</value>
   </data>
+  <data name="GenAIMessageTreeLabel" xml:space="preserve">
+    <value>Generative AI messages</value>
+  </data>
   <data name="GenAIMessageCategoryToolCalls" xml:space="preserve">
     <value>Tool calls</value>
   </data>
@@ -539,7 +545,7 @@
     <value>AI agents</value>
   </data>
   <data name="AIAgentsDialogStandaloneDescription" xml:space="preserve">
-    <value>Give AI agents deep observability into your app so they can diagnose issues faster and verify fixes with confidence 🚀
+    <value>Aspire gives AI coding agents deep observability into your app using the same information visible in the dashboard. Agents use telemetry to diagnose issues faster and verify fixes with confidence. 🚀
 
 - 📊 Distributed traces
 - 🔗 Trace spans
@@ -560,14 +566,16 @@ For more information about using AI agents with the dashboard, including setting
     <comment>{0} is the dashboard URL, {1} is the learn more URL, {2} is the install CLI URL</comment>
   </data>
   <data name="AIAgentsDialogAppHostDescription" xml:space="preserve">
-    <value>Give AI agents deep observability into your app so they can diagnose issues faster and verify fixes with confidence 🚀
+    <value>Aspire gives AI coding agents deep observability into your app using the same information visible in the dashboard. Agents use telemetry to diagnose issues faster and verify fixes with confidence. 🚀
 
 - 📦 Resource state, health checks, and relationships
 - 🖥️ Console logs
 - 📊 Distributed traces
 - 🪵 Structured logs
 
-AI agents access dashboard telemetry through the Aspire CLI. If you haven’t installed it yet, [install the Aspire CLI]({1}).
+## Getting started
+
+AI agents access dashboard telemetry through the Aspire CLI. If you haven't installed it yet, [install the Aspire CLI]({1}).
 
 Initialize AI agent support in your project with:
 

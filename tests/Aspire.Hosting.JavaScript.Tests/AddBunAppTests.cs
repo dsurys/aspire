@@ -4,7 +4,6 @@
 #pragma warning disable ASPIREDOCKERFILEBUILDER001 // Type is for evaluation purposes only
 
 using Aspire.Hosting.ApplicationModel;
-using Aspire.Hosting.Dcp.Model;
 using Aspire.Hosting.Tests.Utils;
 using Aspire.Hosting.Utils;
 using Microsoft.Extensions.DependencyInjection;
@@ -359,14 +358,14 @@ public class AddBunAppTests(ITestOutputHelper outputHelper)
     }
 
     [Fact]
-    public void BunApp_DirectFile_ProducesBunRuntimeExecutable()
+    public async Task BunApp_DirectFile_ProducesBunRuntimeExecutable()
     {
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run);
         using var workspace = TemporaryWorkspace.Create(outputHelper);
 
         var bunApp = builder.AddBunApp("bunapp", workspace.Path, "server.ts");
 
-        var launchConfig = InvokeLaunchConfigurationAnnotator(bunApp.Resource);
+        var launchConfig = await CreateLaunchConfigurationAsync(bunApp.Resource);
 
         Assert.Equal("bun", launchConfig.Type);
         Assert.Equal("bun", launchConfig.RuntimeExecutable);
@@ -375,7 +374,7 @@ public class AddBunAppTests(ITestOutputHelper outputHelper)
     }
 
     [Fact]
-    public void BunApp_WithRunScriptAndPackageManager_ProducesBunRuntimeExecutable()
+    public async Task BunApp_WithRunScriptAndPackageManager_ProducesBunRuntimeExecutable()
     {
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run);
         using var workspace = TemporaryWorkspace.Create(outputHelper);
@@ -387,24 +386,18 @@ public class AddBunAppTests(ITestOutputHelper outputHelper)
         var bunApp = builder.AddBunApp("bunapp", workspace.Path, "server.ts")
             .WithRunScript("dev");
 
-        var launchConfig = InvokeLaunchConfigurationAnnotator(bunApp.Resource);
+        var launchConfig = await CreateLaunchConfigurationAsync(bunApp.Resource);
 
         Assert.Equal("bun", launchConfig.Type);
         Assert.Equal("bun", launchConfig.RuntimeExecutable);
         Assert.Equal("package-manager", launchConfig.LaunchMethod);
     }
 
-    private static JavaScriptLaunchConfiguration InvokeLaunchConfigurationAnnotator(IResource resource)
+    private static async Task<JavaScriptLaunchConfiguration> CreateLaunchConfigurationAsync(IResource resource)
     {
-        Assert.True(resource.TryGetLastAnnotation<SupportsDebuggingAnnotation>(out var supportsDebugging));
-
-        var exe = Executable.Create("test", "bun");
-        supportsDebugging.LaunchConfigurationAnnotator(exe, ExecutableLaunchMode.Debug);
-
-        Assert.True(exe.TryGetAnnotationAsObjectList<JavaScriptLaunchConfiguration>(
-            Executable.LaunchConfigurationsAnnotation,
-            out var launchConfigs));
-        return Assert.Single(launchConfigs);
+        var callbackContext = LaunchConfigurationTestHelpers.CreateCallbackContext(resource);
+        return Assert.IsType<JavaScriptLaunchConfiguration>(
+            await LaunchConfigurationTestHelpers.InvokeLaunchConfigurationProducerAsync(resource, callbackContext));
     }
 
 #pragma warning restore ASPIREEXTENSION001 // Type is for evaluation purposes only

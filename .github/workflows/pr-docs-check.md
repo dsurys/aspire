@@ -41,22 +41,10 @@ if: >-
 # agent into a retry loop that crossed the 25M effective-token rail and
 # hard-failed the run.
 #
-# The PRIMARY runaway protection is behavioral, not numeric: the anti-loop
-# guidance in "Create Draft PR" below treats any deterministic
-# `create_pull_request` failure as non-retryable, so the loop is stopped at its
-# source. `max-turns` is only a coarse backstop for a true runaway, plus the
-# 25M `maxEffectiveTokens` rail remains the ultimate hard stop.
-#
-# This cap is deliberately set ABOVE the known-good ceiling rather than just
-# above a skip run. AWF audit data: healthy skip-path runs use ~4-5 inference
-# requests, but a heavy-but-SUCCESSFUL skip run was observed at ~35 requests,
-# and a real doc-DRAFTING run (read the skill, pull comment threads + file
-# patches, browse docs, write several files, open the PR) legitimately needs
-# more than a skip. A cap at or below that ceiling would truncate a valid
-# drafting run mid-flight — and a truncated run never emits `notify_source_pr`,
-# so the source PR would get no comment at all. 50 leaves the drafting path
-# ample headroom while still cutting a pathological loop long before it could
-# accrete a runaway transcript, with the AWF token rail backing it up.
+# Prepared skill/patch inputs and bounded research reduce wasted invocations.
+# The prompt reserves the final calls for completion, queues the notification
+# before terminal PR creation, and prohibits retrying deterministic failures.
+# Keep the cap as a backstop; incomplete output still fails outcome validation.
 max-turns: 50
 
 checkout:
@@ -74,26 +62,19 @@ checkout:
   # `git -C <mirror> rev-parse --verify refs/heads/<branch>^{commit}`, which fails
   # with `fatal: Needed a single revision` because the branch only exists in the
   # workspace (microsoft/aspire#18319, run 27765082872). The manifest already
-  # maps `microsoft/aspire.dev -> path=""` (the workspace) here, so a mirror is
-  # not needed for the handler to rediscover the target repo. The safe-outputs
-  # job keeps its own separate `_repos/aspire.dev` checkout for bundle apply.
+  # maps `microsoft/aspire.dev -> path="."` (the workspace) here, so a mirror is
+  # not needed for the handler to rediscover the target repo. The compiler-generated
+  # safe-outputs job checks out the target repo at its workspace root for bundle apply.
   - repository: microsoft/aspire.dev
+    # gh-aw v0.85+ otherwise places cross-repository checkouts in a directory
+    # named after the repository, but this workflow authors docs at workspace root.
+    path: .
     github-app:
-      app-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
+      client-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
       private-key: ${{ secrets.ASPIRE_BOT_PRIVATE_KEY }}
       owner: "microsoft"
       repositories: ["aspire.dev"]
     current: true
-    # Fetch release/* refs in addition to the default branch so the
-    # `Resolve target aspire.dev branch` pre-agent step (and the agent
-    # itself, when it switches the workspace to the effective branch) can
-    # enumerate aspire.dev's release/* branches locally from
-    # `refs/remotes/origin/release/*`. If this fetch silently produces
-    # nothing (e.g., the action ignores the refspec), the resolver still
-    # falls back to a `gh api /repos/microsoft/aspire.dev/branches` call
-    # using the aspire-bot installation token, so target-branch selection
-    # remains correct — the local refs are just a faster, offline path.
-    fetch: ["release/*"]
 
 permissions:
   contents: read
@@ -115,45 +96,108 @@ tools:
     allowed-repos:
       - microsoft/*
     github-app:
-      app-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
+      client-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
       private-key: ${{ secrets.ASPIRE_BOT_PRIVATE_KEY }}
       owner: "microsoft"
       repositories: ["aspire.dev", "aspire"]
 
+jobs:
+  validate-docs-outcome:
+    name: "Validate documentation outcome"
+    needs: [agent, safe_outputs]
+    if: >-
+      (!cancelled())
+      && needs.agent.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out outcome validator
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/pr-docs-check/resolve_safe_output_target.py
+            .github/workflows/pr-docs-check/validate_outcome.py
+          sparse-checkout-cone-mode: false
+      - name: Download agent output
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: agent
+          path: /tmp/gh-aw/
+      - name: Mint aspire-bot token (microsoft/aspire.dev)
+        id: aspire-dev-token
+        if: needs.safe_outputs.outputs.created_pr_url != ''
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
+          private-key: ${{ secrets.ASPIRE_BOT_PRIVATE_KEY }}
+          owner: microsoft
+          repositories: aspire.dev
+      - name: Resolve drafted PR base
+        id: drafted-pr-base
+        if: needs.safe_outputs.outputs.created_pr_url != ''
+        env:
+          CREATED_PR_URL: ${{ needs.safe_outputs.outputs.created_pr_url }}
+          GH_TOKEN: ${{ steps.aspire-dev-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${CREATED_PR_URL}" =~ ^https://github\.com/microsoft/aspire\.dev/pull/([1-9][0-9]*)$ ]]; then
+            echo "ERROR: Created PR URL is not a microsoft/aspire.dev pull request." >&2
+            exit 1
+          fi
+
+          ACTUAL_BASE="$(gh api \
+            "/repos/microsoft/aspire.dev/pulls/${BASH_REMATCH[1]}" \
+            --jq '.base.ref // ""')"
+          if ! [[ "${ACTUAL_BASE}" =~ ^(main|release/[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+            echo "ERROR: Drafted PR has an invalid target branch." >&2
+            exit 1
+          fi
+
+          echo "base=${ACTUAL_BASE}" >> "${GITHUB_OUTPUT}"
+      - name: Require a conclusive documentation outcome
+        env:
+          CREATED_PR_BASE: ${{ steps.drafted-pr-base.outputs.base }}
+          CREATED_PR_URL: ${{ needs.safe_outputs.outputs.created_pr_url }}
+          EXPECTED_SOURCE_PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+        run: >-
+          python .github/workflows/pr-docs-check/validate_outcome.py
+          --agent-output /tmp/gh-aw/agent_output.json
+          --raw-safe-outputs /tmp/gh-aw/safeoutputs.jsonl
+          --created-pr-url "${CREATED_PR_URL}"
+          --created-pr-base "${CREATED_PR_BASE}"
+          --expected-source-pr-number "${EXPECTED_SOURCE_PR_NUMBER}"
+
 safe-outputs:
   github-app:
-    app-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
+    client-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
     private-key: ${{ secrets.ASPIRE_BOT_PRIVATE_KEY }}
     owner: "microsoft"
     repositories: ["aspire.dev", "aspire"]
   steps:
-    - name: Mirror target repo checkout
+    - name: Check out safe-output target resolver
       if: contains(needs.agent.outputs.output_types, 'create_pull_request')
-      uses: actions/checkout@v6.0.2
+      uses: actions/checkout@v7.0.1
       with:
-        repository: microsoft/aspire.dev
-        # Seed the mirrored workspace at aspire.dev main. The safe-outputs
-        # handler will fetch and use the agent-provided `base` override when
-        # creating the PR, restricted by `allowed-base-branches` below.
-        ref: main
-        token: ${{ steps.safe-outputs-app-token.outputs.token }}
+        path: _resolver
         persist-credentials: false
-        path: _repos/aspire.dev
-        fetch-depth: 1
-    - name: Configure mirrored target repo Git credentials
+        sparse-checkout: .github/workflows/pr-docs-check/resolve_safe_output_target.py
+        sparse-checkout-cone-mode: false
+    - name: Resolve safe-output patch base from canonical agent output
+      id: resolve-target
       if: contains(needs.agent.outputs.output_types, 'create_pull_request')
-      working-directory: _repos/aspire.dev
       env:
-        REPO_NAME: "microsoft/aspire.dev"
-        SERVER_URL: ${{ github.server_url }}
-        GIT_TOKEN: ${{ steps.safe-outputs-app-token.outputs.token }}
+        EXPECTED_SOURCE_PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
       run: |
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git config --global user.name "github-actions[bot]"
-        git config --global am.keepcr true
-        SERVER_URL_STRIPPED="${SERVER_URL#https://}"
-        git remote set-url origin "https://x-access-token:${GIT_TOKEN}@${SERVER_URL_STRIPPED}/${REPO_NAME}.git"
-        echo "Mirrored checkout configured with standard GitHub Actions identity"
+        set -euo pipefail
+        trap 'rm -rf -- _resolver' EXIT
+        python3 _resolver/.github/workflows/pr-docs-check/resolve_safe_output_target.py \
+          --agent-output /tmp/gh-aw/agent_output.json \
+          --raw-safe-outputs /tmp/gh-aw/safeoutputs.jsonl \
+          --github-output "${GITHUB_OUTPUT}" \
+          --expected-source-pr-number "${EXPECTED_SOURCE_PR_NUMBER}"
   create-pull-request:
     title-prefix: "[docs] "
     labels: [docs-from-code]
@@ -162,10 +206,11 @@ safe-outputs:
     # that decision can't live in static frontmatter. The `notify-source-pr`
     # safe-output job below requests the SME on the drafted PR after creation.
     draft: true
-    # Default to aspire.dev main, but allow the agent to override the PR base
-    # per run using the milestone/linked-issue/source-base reasoning in the
-    # prompt body. Restrict overrides to main and release/*.
-    base-branch: main
+    # Generate the agent-time patch against the aspire.dev branch selected below.
+    # At apply time, the separate safe-outputs job resolves that trusted branch
+    # from canonical output or the safe-output server metadata retained in raw
+    # JSONL, then cross-checks it against the drafted notification.
+    base-branch: ${{ steps.resolve-target.outputs.branch || 'main' }}
     allowed-base-branches:
       - main
       - release/*
@@ -184,9 +229,10 @@ safe-outputs:
         opened on microsoft/aspire.dev) request a review from the SME
         identified from the source PR.
 
-        Emit exactly one `notify_source_pr` item per run, after you've finished
-        any `create_pull_request` or no-docs-needed reasoning. Use `result:
-        "drafted"` when you just emitted a `create_pull_request`; use `result:
+        Emit exactly one `notify_source_pr` item per run. On the drafting path,
+        prepare both payloads, emit this notification intent immediately BEFORE
+        `create_pull_request`, then make PR creation your final action. Use `result:
+        "drafted"` when you are ready to emit `create_pull_request`; use `result:
         "skipped"` when no docs PR is needed; use `result: "draft_failed"` when
         docs WERE required but you could not produce a docs PR (a genuine
         failure that must be surfaced, not reported as a green no-op). DO NOT
@@ -203,7 +249,7 @@ safe-outputs:
           required: true
           type: number
         result:
-          description: "'drafted' if a docs PR was opened on microsoft/aspire.dev; 'skipped' if no docs PR was needed; 'draft_failed' if docs were required but a docs PR could not be produced."
+          description: "'drafted' when ready to request a docs PR on microsoft/aspire.dev (post-processing verifies creation); 'skipped' if no docs PR was needed; 'draft_failed' if docs were required but a docs PR could not be prepared."
           required: true
           type: string
         sme_login:
@@ -219,26 +265,71 @@ safe-outputs:
           required: true
           type: string
       steps:
-        - name: Mint aspire-bot token (microsoft/aspire)
-          id: aspire-token
-          uses: actions/create-github-app-token@v3.1.1
+        - name: Check out outcome validator
+          uses: actions/checkout@v7.0.1
           with:
-            app-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
-            private-key: ${{ secrets.ASPIRE_BOT_PRIVATE_KEY }}
-            owner: microsoft
-            repositories: aspire
+            persist-credentials: false
+            path: _validator
+            sparse-checkout: |
+              .github/workflows/pr-docs-check/resolve_safe_output_target.py
+              .github/workflows/pr-docs-check/validate_outcome.py
+            sparse-checkout-cone-mode: false
         - name: Mint aspire-bot token (microsoft/aspire.dev)
           id: aspire-dev-token
           if: needs.safe_outputs.outputs.created_pr_url != ''
-          uses: actions/create-github-app-token@v3.1.1
+          uses: actions/create-github-app-token@v3.2.0
           with:
-            app-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
+            client-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
             private-key: ${{ secrets.ASPIRE_BOT_PRIVATE_KEY }}
             owner: microsoft
             repositories: aspire.dev
-        - name: Post status comment on source PR
-          uses: actions/github-script@v9
+        - name: Resolve drafted PR base
+          id: drafted-pr-base
+          if: needs.safe_outputs.outputs.created_pr_url != ''
           env:
+            CREATED_PR_URL: ${{ needs.safe_outputs.outputs.created_pr_url }}
+            GH_TOKEN: ${{ steps.aspire-dev-token.outputs.token }}
+          run: |
+            set -euo pipefail
+
+            if ! [[ "${CREATED_PR_URL}" =~ ^https://github\.com/microsoft/aspire\.dev/pull/([1-9][0-9]*)$ ]]; then
+              echo "ERROR: Created PR URL is not a microsoft/aspire.dev pull request." >&2
+              exit 1
+            fi
+
+            ACTUAL_BASE="$(gh api \
+              "/repos/microsoft/aspire.dev/pulls/${BASH_REMATCH[1]}" \
+              --jq '.base.ref // ""')"
+            if ! [[ "${ACTUAL_BASE}" =~ ^(main|release/[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+              echo "ERROR: Drafted PR has an invalid target branch." >&2
+              exit 1
+            fi
+
+            echo "base=${ACTUAL_BASE}" >> "${GITHUB_OUTPUT}"
+        - name: Prepare trusted documentation outcome
+          env:
+            CREATED_PR_BASE: ${{ steps.drafted-pr-base.outputs.base }}
+            CREATED_PR_URL: ${{ needs.safe_outputs.outputs.created_pr_url }}
+          run: >-
+            python _validator/.github/workflows/pr-docs-check/validate_outcome.py
+            --agent-output "${GH_AW_AGENT_OUTPUT}"
+            --raw-safe-outputs "$(dirname "${GH_AW_AGENT_OUTPUT}")/safeoutputs.jsonl"
+            --created-pr-url "${CREATED_PR_URL}"
+            --created-pr-base "${CREATED_PR_BASE}"
+            --github-event-path "${GITHUB_EVENT_PATH}"
+            --write-side-effect-outcome "${RUNNER_TEMP}/pr-docs-check-side-effect-outcome.json"
+        - name: Mint aspire-bot token (microsoft/aspire)
+          id: aspire-token
+          uses: actions/create-github-app-token@v3.2.0
+          with:
+            client-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
+            private-key: ${{ secrets.ASPIRE_BOT_PRIVATE_KEY }}
+            owner: microsoft
+            repositories: aspire
+        - name: Post status comment on source PR
+          uses: actions/github-script@v9.0.0
+          env:
+            CANONICAL_OUTCOME_PATH: ${{ runner.temp }}/pr-docs-check-side-effect-outcome.json
             DRAFT_PR_URL: ${{ needs.safe_outputs.outputs.created_pr_url }}
             DRAFT_PR_NUMBER: ${{ needs.safe_outputs.outputs.created_pr_number }}
           with:
@@ -248,50 +339,38 @@ safe-outputs:
               const MARKER = '<!-- pr-docs-check:notify-source-pr -->';
               const SUMMARY_MAX = 2000;
 
-              const outputPath = process.env.GH_AW_AGENT_OUTPUT;
+              const outputPath = process.env.CANONICAL_OUTCOME_PATH;
               if (!outputPath || !fs.existsSync(outputPath)) {
-                core.warning(`Agent output file not found at ${outputPath}; skipping comment.`);
+                core.warning(`Canonical outcome file not found at ${outputPath}; skipping comment.`);
                 return;
               }
 
-              let payload;
+              let outcome;
               try {
-                payload = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
+                outcome = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
               } catch (e) {
-                core.warning(`Failed to parse agent output: ${e.message}`);
+                core.warning(`Failed to parse canonical outcome: ${e.message}`);
                 return;
               }
-              const items = (payload && Array.isArray(payload.items)) ? payload.items : [];
-              const item = items.find(i => i && i.type === 'notify_source_pr');
-              if (!item) {
-                core.info('No notify_source_pr item in agent output; nothing to post.');
+              if (!outcome.allow_comment) {
+                core.warning(`Canonical outcome rejected source comment: ${outcome.diagnostic || 'unknown reason'}`);
                 return;
               }
 
-              // Source PR number is supplied by the agent. Validate it as a
-              // positive integer with a sane upper bound; the safe-jobs framework
-              // does not pass workflow-context expressions through env: cleanly,
-              // and threat detection has already gated this output.
-              const agentNumber = parseInt(String(item.source_pr_number), 10);
-              if (!Number.isInteger(agentNumber) || agentNumber <= 0 || agentNumber > 10_000_000) {
-                core.warning(`Invalid source_pr_number from agent: ${item.source_pr_number}; skipping comment.`);
-                return;
-              }
-              const sourcePrNumber = agentNumber;
-
-              const result = (item.result || '').toString().trim().toLowerCase();
-              const targetBranch = (item.target_branch || '').toString().trim();
+              const sourcePrNumber = outcome.source_pr_number;
+              const renderKind = (outcome.render_kind || '').toString();
+              const targetBranch = (outcome.target_branch || '').toString().trim();
               const draftUrl = (process.env.DRAFT_PR_URL || '').trim();
               const draftNumber = (process.env.DRAFT_PR_NUMBER || '').trim();
 
               // Bound the agent-supplied summary so a malformed item can't blow up the comment.
-              let summary = (item.summary || '').toString().trim();
+              let summary = (outcome.summary || '').toString().trim();
               if (summary.length > SUMMARY_MAX) {
                 summary = summary.slice(0, SUMMARY_MAX) + '\n\n_(summary truncated)_';
               }
 
               let body;
-              if (result === 'drafted' && draftUrl) {
+              if (renderKind === 'drafted') {
                 const branchSuffix = targetBranch ? ` targeting \`${targetBranch}\`` : '';
                 const numberDisplay = draftNumber || '?';
                 body = [
@@ -303,7 +382,7 @@ safe-outputs:
                   '> [!NOTE]',
                   '> This draft PR needs human review before merging.'
                 ].join('\n');
-              } else if (result === 'drafted') {
+              } else if (renderKind === 'drafted_missing_pr') {
                 // Agent intended to draft a PR but the safe-outputs handler did not produce
                 // a created_pr_url. Surface this as a failure rather than a "skipped" result.
                 body = [
@@ -314,14 +393,9 @@ safe-outputs:
                   '',
                   summary
                 ].join('\n');
-              } else if (result === 'draft_failed') {
-                // Step 5 determined docs WERE required, but Step 10 could not
-                // produce a docs PR (e.g. a base-branch/validation error, a
-                // protected-file rejection, or an empty/invalid patch). This is
-                // a genuine failure, not a no-op: surface it under the ⚠️ banner
-                // so the author sees that documentation is still owed, rather
-                // than letting it fall through to the green "no update needed"
-                // branch below. The agent-supplied summary names the reason.
+              } else if (renderKind === 'draft_failed') {
+                // Docs were required, but the agent could not prepare a valid
+                // draft. Keep this distinct from "skipped": docs are still owed.
                 body = [
                   MARKER,
                   '⚠️ Documentation was required for this change, but a docs PR could not be drafted automatically.',
@@ -330,12 +404,21 @@ safe-outputs:
                   '',
                   `See the workflow run for details: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
                 ].join('\n');
-              } else {
+              } else if (renderKind === 'skipped') {
                 body = [
                   MARKER,
                   '✅ No documentation update needed.',
                   '',
                   summary
+                ].join('\n');
+              } else {
+                body = [
+                  MARKER,
+                  '⚠️ The documentation workflow returned an invalid or inconsistent result and could not confirm the outcome.',
+                  '',
+                  summary,
+                  '',
+                  `See the workflow run for details: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
                 ].join('\n');
               }
 
@@ -365,42 +448,55 @@ safe-outputs:
                 core.warning(`Failed to enumerate prior comments: ${e.message}`);
               }
 
-              await github.rest.issues.createComment({
-                owner: 'microsoft',
-                repo: 'aspire',
-                issue_number: sourcePrNumber,
-                body,
-              });
-              core.info(`Posted ${result || 'unknown'} comment on microsoft/aspire#${sourcePrNumber}`);
+              try {
+                await github.rest.issues.createComment({
+                  owner: 'microsoft',
+                  repo: 'aspire',
+                  issue_number: sourcePrNumber,
+                  body,
+                });
+              } catch (e) {
+                // Locked conversations reject bot comments even after a docs PR
+                // was created. Preserve that outcome without hiding other 403s.
+                if (e.status !== 403 || e.response?.data?.message !== 'Unable to create comment because issue is locked.') {
+                  throw e;
+                }
+                core.warning(`Source PR microsoft/aspire#${sourcePrNumber} is locked; the documentation outcome is recorded in the job summary.`);
+                await core.summary
+                  .addRaw(`Source PR microsoft/aspire#${sourcePrNumber} is locked; no comment was posted.\n\n`)
+                  .addRaw(body)
+                  .write();
+                return;
+              }
+              core.info(`Posted ${renderKind || 'unknown'} comment on microsoft/aspire#${sourcePrNumber}`);
         - name: Request SME review on draft PR
           if: needs.safe_outputs.outputs.created_pr_url != ''
-          uses: actions/github-script@v9
+          uses: actions/github-script@v9.0.0
           env:
+            CANONICAL_OUTCOME_PATH: ${{ runner.temp }}/pr-docs-check-side-effect-outcome.json
             DRAFT_PR_NUMBER: ${{ needs.safe_outputs.outputs.created_pr_number }}
           with:
             github-token: ${{ steps.aspire-dev-token.outputs.token }}
             script: |
               const fs = require('fs');
 
-              const outputPath = process.env.GH_AW_AGENT_OUTPUT;
+              const outputPath = process.env.CANONICAL_OUTCOME_PATH;
               if (!outputPath || !fs.existsSync(outputPath)) {
-                core.info('Agent output file not found; skipping reviewer request.');
+                core.info('Canonical outcome file not found; skipping reviewer request.');
                 return;
               }
-              let payload;
+              let outcome;
               try {
-                payload = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
+                outcome = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
               } catch (e) {
-                core.warning(`Failed to parse agent output: ${e.message}`);
+                core.warning(`Failed to parse canonical outcome: ${e.message}`);
                 return;
               }
-              const items = (payload && Array.isArray(payload.items)) ? payload.items : [];
-              const item = items.find(i => i && i.type === 'notify_source_pr');
-              if (!item) {
-                core.info('No notify_source_pr item; skipping reviewer request.');
+              if (!outcome.allow_sme_review) {
+                core.info(`Canonical outcome rejected SME review: ${outcome.diagnostic || 'outcome is not a confirmed draft'}`);
                 return;
               }
-              const sme = (item.sme_login || '').toString().trim().replace(/^@/, '');
+              const sme = (outcome.sme_login || '').toString().trim().replace(/^@/, '');
               if (!sme) {
                 core.info('No SME login provided; leaving draft PR without an explicit reviewer.');
                 return;
@@ -435,6 +531,24 @@ safe-outputs:
 # agent starts and writes the result to .pr-docs-check/target.json. The
 # agent reads that file verbatim and never re-derives the branch.
 pre-agent-steps:
+  - name: Check out pre-agent scripts
+    # The `checkout:` block above made microsoft/aspire.dev the current
+    # workspace because that's where the doc PR is authored. We need a sparse,
+    # side-by-side checkout of microsoft/aspire before target resolution so the
+    # tested checkout helper can switch branches and restore trusted runtime
+    # configuration deterministically.
+    #
+    # For a merged pull_request:closed event, the default `ref` is the updated
+    # base branch; for workflow_dispatch, it is the dispatcher-selected ref.
+    # Both select the helper version associated with the workflow being run.
+    uses: actions/checkout@v7.0.1
+    with:
+      persist-credentials: false
+      repository: microsoft/aspire
+      path: _repos/aspire
+      sparse-checkout: |
+        .github/workflows/pr-docs-check
+      sparse-checkout-cone-mode: false
   # Mint a short-lived installation token from the aspire-bot GitHub App so
   # the resolver below can read PR/issue metadata from microsoft/aspire AND
   # list branches on microsoft/aspire.dev. The default GITHUB_TOKEN is scoped
@@ -449,15 +563,16 @@ pre-agent-steps:
   # token with the same two repos here.
   - name: Mint app token for target-branch resolver
     id: resolve-target-app-token
-    uses: actions/create-github-app-token@v3.1.1
+    uses: actions/create-github-app-token@v3.2.0
     with:
-      app-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
+      client-id: ${{ secrets.ASPIRE_BOT_APP_ID }}
       private-key: ${{ secrets.ASPIRE_BOT_PRIVATE_KEY }}
       owner: microsoft
       repositories: |
         aspire
         aspire.dev
-  - name: Resolve target aspire.dev branch
+  - name: Resolve and check out target aspire.dev branch
+    id: resolve-target
     env:
       GH_TOKEN: ${{ steps.resolve-target-app-token.outputs.token }}
       # event.pull_request.number is set on `pull_request: closed` triggers;
@@ -483,6 +598,10 @@ pre-agent-steps:
       # instead of an opaque parse failure.
       if ! [[ "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: PR_NUMBER '${PR_NUMBER}' is not a positive integer." >&2
+        exit 1
+      fi
+      if ! git -C "${GITHUB_WORKSPACE}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "ERROR: Aspire.dev workspace is not a Git work tree: ${GITHUB_WORKSPACE}" >&2
         exit 1
       fi
 
@@ -649,13 +768,9 @@ pre-agent-steps:
       echo "Candidate     : ${CANDIDATE} (source: ${CANDIDATE_SOURCE})"
 
       # --- 5. Enumerate release/* branches on microsoft/aspire.dev ---------
-      # Primary: local git on the current workspace, which is checked out at
-      # microsoft/aspire.dev with `release/*` refs fetched into
-      # `refs/remotes/origin/release/*` via the workflow `checkout:` block.
-      #
-      # Fallback: `gh api /repos/microsoft/aspire.dev/branches` paginated.
-      # Used if the local fetch produced nothing (e.g., no release branches
-      # have been pushed yet, or the fetch silently failed). The GH_TOKEN
+      # Query aspire.dev directly. The generated PR checkout configures origin
+      # for microsoft/aspire before this step, so its remote-tracking refs must
+      # never be used to infer which branches exist in aspire.dev. The GH_TOKEN
       # used here is the aspire-bot installation token minted at the top of
       # `pre-agent-steps`, which has explicit `contents: read` on both
       # microsoft/aspire and microsoft/aspire.dev — the default GITHUB_TOKEN
@@ -665,26 +780,10 @@ pre-agent-steps:
       RELEASE_BRANCHES_FILE="$(mktemp)"
       : > "${RELEASE_BRANCHES_FILE}"
 
-      if git -C "${GITHUB_WORKSPACE}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        git -C "${GITHUB_WORKSPACE}" for-each-ref \
-          --format='%(refname:short)' 'refs/remotes/origin/release/*' \
-          | sed 's|^origin/||' > "${RELEASE_BRANCHES_FILE}" || true
-      fi
-
-      if [ -s "${RELEASE_BRANCHES_FILE}" ]; then
-        ENUMERATION_SOURCE="git"
-      else
-        echo "Local git enumeration returned no release/* branches; falling back to gh api"
-        if gh api --paginate "/repos/microsoft/aspire.dev/branches?per_page=100" \
-            | jq -r '.[].name | select(startswith("release/"))' \
-            > "${RELEASE_BRANCHES_FILE}" 2>/dev/null; then
-          ENUMERATION_SOURCE="gh_api"
-        else
-          echo "  WARN: gh api fallback for aspire.dev branches failed; treating list as empty"
-          : > "${RELEASE_BRANCHES_FILE}"
-          ENUMERATION_SOURCE="empty"
-        fi
-      fi
+      python3 \
+        "${GITHUB_WORKSPACE}/_repos/aspire/.github/workflows/pr-docs-check/enumerate_release_branches.py" \
+        > "${RELEASE_BRANCHES_FILE}"
+      ENUMERATION_SOURCE="gh_api"
 
       # De-duplicate and sort so the JSON output is deterministic across runs.
       sort -u -o "${RELEASE_BRANCHES_FILE}" "${RELEASE_BRANCHES_FILE}"
@@ -750,6 +849,9 @@ pre-agent-steps:
       rm -f "${RELEASE_BRANCHES_FILE}" "${PR_JSON}"
 
       echo "Effective     : ${EFFECTIVE} (resolution=${RESOLUTION})"
+      echo "branch=${EFFECTIVE}" >> "${GITHUB_OUTPUT}"
+
+      DOCS_WORK_BRANCH="docs/pr-${PR_NUMBER}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
       # --- 7. Emit target.json ---------------------------------------------
       jq -n \
@@ -760,6 +862,7 @@ pre-agent-steps:
         --arg candidate_source_detail "${CANDIDATE_SOURCE_DETAIL}" \
         --arg effective "${EFFECTIVE}" \
         --arg resolution "${RESOLUTION}" \
+        --arg docs_work_branch "${DOCS_WORK_BRANCH}" \
         --argjson available "${AVAILABLE_BRANCHES_JSON}" \
         --arg enumeration_source "${ENUMERATION_SOURCE}" \
         --argjson linked_issues "${LINKED_ISSUES_JSON}" \
@@ -770,6 +873,7 @@ pre-agent-steps:
            candidate_source: $candidate_source,
            candidate_source_detail: $candidate_source_detail,
            effective_target_branch: $effective,
+           docs_work_branch: $docs_work_branch,
            target_resolution: $resolution,
            available_release_branches: $available,
            enumeration_source: $enumeration_source,
@@ -778,6 +882,16 @@ pre-agent-steps:
 
       echo "--- ${OUT} ---"
       cat "${OUT}"
+
+      # --- 8. Prepare the target-based documentation work branch ------------
+      # The helper fetches only a missing target ref (without shallowifying a
+      # full clone), creates a unique branch at the exact target tip, restores
+      # trusted agent configuration, and keeps those runtime-only files out of
+      # Git patches even if the agent uses broad staging.
+      python3 \
+        "${GITHUB_WORKSPACE}/_repos/aspire/.github/workflows/pr-docs-check/checkout_target.py" \
+        "${EFFECTIVE}" \
+        "${DOCS_WORK_BRANCH}"
   # Compute deterministic "is this PR user-facing?" signals from the PR
   # diff and body before the agent starts. Historically the agent reasoned
   # about this directly from the prompt's prose ("is this a significant
@@ -825,25 +939,6 @@ pre-agent-steps:
   # matching unittest suite (`test_compute_signals.py`), so it can be
   # reviewed with syntax highlighting and exercised locally with
   # `python3 -m unittest discover -s .github/workflows/pr-docs-check -v`.
-  - name: Check out pre-agent scripts
-    # The `checkout:` block above made microsoft/aspire.dev the current
-    # workspace because that's where the doc PR is authored. We need a
-    # sparse, side-by-side checkout of microsoft/aspire to bring the
-    # pre-agent scripts (signal computation + PR context) into the runner.
-    # A sparse checkout keeps this fast — only
-    # `.github/workflows/pr-docs-check` is fetched.
-    #
-    # Default `ref` resolves to the trigger ref (refs/pull/<N>/merge for
-    # pull_request: closed, or the dispatcher-selected branch for
-    # workflow_dispatch). That's the correct version of the script for
-    # the merged state being analyzed.
-    uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-    with:
-      repository: microsoft/aspire
-      path: _repos/aspire
-      sparse-checkout: |
-        .github/workflows/pr-docs-check
-      sparse-checkout-cone-mode: false
   - name: Compute user-facing signals and PR context
     env:
       GH_TOKEN: ${{ steps.resolve-target-app-token.outputs.token }}
@@ -922,7 +1017,10 @@ pre-agent-steps:
       python3 _repos/aspire/.github/workflows/pr-docs-check/resolve_sme.py \
         "${PR_CONTEXT_OUT}" "${REVIEWS_JSON}" "${SME_OUT}"
 
-      rm -f "${PR_JSON}" "${FILES_JSON}" "${REVIEWS_JSON}"
+      # Keep patches available for targeted reads without inflating pr.json or
+      # spending model calls fetching and decoding the same API response again.
+      mv "${FILES_JSON}" .pr-docs-check/files.json
+      rm -f "${PR_JSON}" "${REVIEWS_JSON}"
 
       echo "--- ${OUT} ---"
       cat "${OUT}"
@@ -963,6 +1061,26 @@ needed, create a draft PR with the actual documentation changes.
 > `workflow_dispatch` with `pr_number` when a maintainer wants to run the docs
 > check manually for a merged fork PR.
 
+## Execution budget and completion
+
+Keep research bounded within the 50-invocation limit. Read the prepared
+`.pr-docs-check/` inputs together, batch related searches and file reads, and
+start finalizing by invocation 35 so editing and both safe outputs have room.
+Do not repeat searches once you have enough evidence for the smallest accurate
+documentation change. If you cannot safely finish a required draft, emit
+`notify_source_pr` with `result: "draft_failed"` and the concrete blocker rather
+than continuing research until the cap.
+
+The workspace contains documentation, not the Aspire source tree.
+`_repos/aspire` is a sparse checkout of workflow helpers only. Use cached
+patches first and GitHub tools only for additional source context you actually
+need. Never search the whole filesystem for missing inputs.
+
+Prepare both final payloads before submitting them. On the drafting path,
+emit the notification intent first, then `create_pull_request` as the final
+action and stop. PR creation is a terminal safe output: never leave notification
+preparation or emission until afterward.
+
 ## Step 1: Read PR Information
 
 The source PR's metadata was gathered deterministically by a `pre-agent-steps:`
@@ -979,11 +1097,13 @@ use are:
 | `linked_issues` | Same-repo issue numbers from `Closes`/`Fixes`/`Resolves #N` in the body. |
 | `changed_files` | Each `{filename, status, additions, deletions}`. |
 
-Diff hunks (`patch`) are intentionally omitted to keep this file small. Inspect a
-file's diff only for files likely to affect user-facing behavior, configuration,
-or public API surface (or when significance is unclear from the filename), and
-only on the doc-drafting path — fetch the patch for that specific file with the
-GitHub tools in Step 9. Do **not** fetch diffs on the cheap skip path.
+Diff hunks (`patch`) are omitted from this compact file but the already-fetched
+changed-file payload is available in `.pr-docs-check/files.json`. Read only the
+entries for files likely to affect user-facing behavior, configuration, or public
+API surface, and only on the drafting path. Do not read the entire patch payload
+into context. Use GitHub tools only when a needed patch is absent or insufficient;
+do not re-fetch diffs already present locally. Do not fetch diffs on the cheap
+skip path.
 
 **Defer the expensive comment-thread reads until you actually need them.** They
 are only required when you are writing documentation (Step 9), so do **not**
@@ -1001,7 +1121,7 @@ docs-drafting path, fetch:
 PR/review comment threads together as the canonical context.** Steps 9 and 10
 must paraphrase the explanation the author and reviewers wrote, so the docs
 reflect the change as it was reviewed — not as a model might re-imagine it from
-filenames. Step 11 must cite at least one piece of evidence per triggered signal
+filenames. Step 10 must cite at least one piece of evidence per triggered signal
 category, and the comment threads are often where that evidence lives in
 human-readable form.
 
@@ -1042,6 +1162,7 @@ Read `.pr-docs-check/target.json`. The fields you will use are:
 | Field | Purpose |
 | --- | --- |
 | `effective_target_branch` | The branch you must base all docs edits and the draft PR on (`main` or `release/X.Y[.Z]`). |
+| `docs_work_branch` | The unique local branch already created from `effective_target_branch`; use it unchanged as the draft PR head branch. |
 | `candidate_source` | Why the candidate was chosen: `pr_milestone`, `linked_issue_milestone`, `pr_base`, or `fallback_main`. Use it in the PR description. |
 | `candidate_source_detail` | The raw milestone title or base ref that drove the choice. Use it in the PR description. |
 | `target_resolution` | How `effective_target_branch` was chosen: `exact_match`, `latest_release_fallback`, or `main_fallback`. Use it in the PR description. |
@@ -1049,17 +1170,12 @@ Read `.pr-docs-check/target.json`. The fields you will use are:
 The remaining fields (`candidate_target_branch`, `available_release_branches`,
 `enumeration_source`) are context only — don't second-guess the resolution.
 
-The current workspace is `microsoft/aspire.dev`. Switch it to
-`effective_target_branch` before editing docs:
-
-- If `effective_target_branch` is `main`, you are already on the right branch
-  by default; no switch is required.
-- If `effective_target_branch` starts with `release/`, run
-  `git checkout <effective_target_branch>` (the workflow `checkout:` block has
-  already fetched `release/*` refs into `refs/remotes/origin/release/*`).
-
-Do **not** create new branches or modify the resolution. The
-`create_pull_request` safe output's `base` field must be set to exactly
+The current workspace is `microsoft/aspire.dev`. The resolver has already
+created and checked out `docs_work_branch` at the exact tip of
+`effective_target_branch` before you started. Do not create another branch,
+switch branches, or reset the workspace. Keep all docs edits and commits on
+`docs_work_branch`. The `create_pull_request` safe output's `branch` field must
+be set to exactly `docs_work_branch`, and its `base` field must be set to exactly
 `effective_target_branch`.
 
 ## Step 4: Read the Pre-Computed User-Facing Signals
@@ -1117,7 +1233,7 @@ internal reasoning** like:
 > Triggered signals (5): `cli_command_added`, `cli_command_file_changed`, `cli_option_added`, `cli_resource_strings_changed`, `mcp_tool_file_changed`. Evidence: `LogsCommand.cs` is a new command file that adds `Option<string?>("--search")`; `LogsCommandStrings.resx` adds `SearchOptionDescription`; `ListConsoleLogsTool.cs` was modified to wire up the new search option.
 
 This enumeration is not optional. The PR description you write in
-Step 10 and the `summary` you emit in Step 11 must both cite at least
+Step 11 and the `summary` you emit in Step 10 must both cite at least
 one `evidence` entry per triggered signal category so a human auditor
 can verify the decision.
 
@@ -1170,7 +1286,7 @@ identifies. To use this exception you **must** do all of the following:
    `SearchOptionDescription`, the JSON property name, the API symbol).
 2. Open the matching docs file and quote a sentence or code block that
    mentions the identifier by name.
-3. In the `notify_source_pr` `summary` (Step 11), include — per
+3. In the `notify_source_pr` `summary` (Step 10), include — per
    triggered signal — the docs file path **and** the quoted text. Plain
    statements like *"the existing docs cover this area"* or *"this is
    internal"* are not acceptable; the audit trail must show the
@@ -1251,8 +1367,11 @@ output on the no-docs path.
 
 ## Step 7: Read the doc-writer Skill
 
-Read the file `.github/skills/doc-writer/SKILL.md` from the checked-out
-`microsoft/aspire.dev` workspace. This skill contains comprehensive guidelines for
+Read `.pr-docs-check/doc-writer/SKILL.md` and any relevant relative references.
+The pre-agent helper materialized this skill from the exact selected
+`microsoft/aspire.dev` commit, outside the trusted runtime configuration overlay.
+Do not search `.agents`, `.github`, Git history, or the filesystem for another
+copy. This skill contains comprehensive guidelines for
 writing documentation on the Aspire docs site, including:
 
 - Site structure and file organization
@@ -1318,34 +1437,47 @@ Ensure all changes follow the doc-writer skill guidelines from Step 7. Include:
 - Cross-references to related documentation pages
 - Correct use of Aside, Steps, Tabs, and other components
 
-## Step 10: Create Draft PR
+## Step 10: Prepare and Emit the Documentation Outcome
+
+Finish the documentation edits and prepare the complete PR title, body, branch,
+and base described in Step 11 before emitting any output. Prepare a single
+`notify_source_pr` payload with:
+
+- `source_pr_number`: the source PR number from Step 1.
+- `result`: `"drafted"`.
+- `sme_login`: `SME_LOGIN` from Step 2 (or an empty string).
+- `target_branch`: `effective_target_branch` from `.pr-docs-check/target.json`.
+- `summary`: a short summary of the changes and modified files, citing the
+  triggered signals. Do not invent a PR URL or number.
+
+If you cannot prepare a valid documentation patch, emit `result: "draft_failed"`
+instead, naming the blocker and triggered signals, then stop. Only use
+`"skipped"` when Step 5 permits it, or when the signal is a proven false positive
+with no actual user-facing change; explain that evidence.
+
+When both payloads are ready, emit `notify_source_pr` first and proceed
+immediately to Step 11. `"drafted"` records intent, not a successful remote
+operation: trusted post-processing verifies the actual PR before commenting or
+requesting review. A notification without a created PR still fails validation.
+
+## Step 11: Create Draft PR and Stop
 
 > [!IMPORTANT]
 > Emit `create_pull_request` **exactly once**, and only after you have actually
 > written documentation file changes to the workspace in Step 9. The safe output
 > builds the PR from those workspace changes.
 >
-> **Treat any `create_pull_request` failure as non-retryable and never re-emit the
-> same safe output after it.** Re-emitting after a deterministic error (no commits
-> found, no diff to commit, an empty/invalid patch, a base-branch or validation
-> error, a protected-file rejection, etc.) is a failure loop that burns the run's
-> token budget without making progress. Handle a failure exactly once:
+> **Stop after `create_pull_request`, whether it succeeds or fails.** Never
+> re-emit it, retry a deterministic failure, push manually, or emit another
+> notification. The notification intent was already recorded in Step 10.
+> Trusted post-processing surfaces a missing PR as a failure, not as a skipped
+> documentation update.
 >
-> - If it failed because you had not yet written any doc changes, write them now
->   (Step 9) and emit `create_pull_request` one more time — at most.
-> - If it failed for any other deterministic reason — a base-branch or validation
->   error, a protected-file rejection, or an empty/invalid patch — **stop
->   drafting** and emit a single `notify_source_pr` with `result: "draft_failed"`.
->   Docs were required (Step 5), so this is a genuine failure, not a no-op: the
->   `draft_failed` result is surfaced under a ⚠️ banner so the author knows
->   documentation is still owed. The `summary` must name the failure reason and
->   list the triggered signals. Do not loop.
-> - Only if, on inspection, there is genuinely nothing to document — the
->   triggering signal fired on a string that is not actually an Aspire
->   user-facing feature (a true false positive), so there is no concrete
->   documentation edit to make — **stop drafting** and emit a single
->   `notify_source_pr` with `result: "skipped"` whose `summary` explains that the
->   signal was a false positive and lists the triggered signals. Do not loop.
+> Before emitting the safe output, stage only the documentation paths you
+> intentionally edited. Never use `git add -A`, `git commit -a`, or include
+> runtime-only `.agents`, `.github`, `AGENTS.md`, `.mcp.json`,
+> `.pr-docs-check`, or `_repos` changes. The deterministic checkout helper also
+> hides those runtime files from Git as defense in depth.
 
 Create a draft pull request on `microsoft/aspire.dev` with:
 
@@ -1354,6 +1486,10 @@ Create a draft pull request on `microsoft/aspire.dev` with:
 `create_pull_request` safe output, set its `base` field to that exact string
 (for example, `release/13.3`, `release/13.2.1`, or `main`). Do not derive or
 modify this value.
+
+**Head branch**: the `docs_work_branch` value from
+`.pr-docs-check/target.json`. Set the safe output's `branch` field to that exact
+string. Do not derive, rename, or replace it.
 
 **Title**: A clear, concise title describing the documentation work
 (the `[docs]` prefix will be added automatically)
@@ -1385,25 +1521,8 @@ Do **not** include `reviewers` in the `create_pull_request` emission. The SME
 identified in Step 2 is requested as a reviewer by the `notify_source_pr`
 safe-output job, not by `create_pull_request`.
 
-## Step 11: Notify Source PR
-
-After emitting `create_pull_request`, emit a single `notify_source_pr` safe output
-with:
-
-- `source_pr_number`: the source PR number from Step 1.
-- `result`: `"drafted"`.
-- `sme_login`: `SME_LOGIN` from Step 2 (or an empty string if none was found).
-- `target_branch`: the `effective_target_branch` value from
-  `.pr-docs-check/target.json` (read in Step 3) — for example,
-  `release/13.3` or `main`. Do not derive or modify this value.
-- `summary`: a short markdown summary (1–3 sentences plus optional bullet list)
-  of the documentation changes made. List the files modified or created. Do **not**
-  describe links here — the workflow injects the drafted PR's URL automatically.
-
 > [!IMPORTANT]
-> Do **not** try to compose the drafted PR's URL or PR number yourself in the
-> `summary` text. The `notify_source_pr` safe-output job knows the real values
-> from the safe-outputs handler and will substitute them when posting the
-> comment. Likewise, do **not** call `add_comment` for the "drafted",
-> "skipped", or "draft_failed" path — `notify_source_pr` is the only commenting
-> path used by this workflow.
+> Do not call `add_comment` on any path. The `notify_source_pr` job uses the
+> previously queued intent and the handler's real PR URL and number to post the
+> outcome after validating the target base. No agent work remains
+> after PR creation.

@@ -23,7 +23,7 @@ public class QdrantFunctionalTests(ITestOutputHelper testOutputHelper)
     private static readonly float[] s_testVector = { 0.10022575f, -0.23998135f };
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyQdrantResource()
     {
         var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
@@ -59,7 +59,7 @@ public class QdrantFunctionalTests(ITestOutputHelper testOutputHelper)
 
             await CreateTestDataAsync(qdrantClient, token);
 
-            var results = await qdrantClient.SearchAsync(CollectionName, s_testVector, limit: 1, cancellationToken: token);
+            var results = await qdrantClient.QueryAsync(CollectionName, s_testVector, limit: 1, cancellationToken: token);
             Assert.Collection(results,
                 r => Assert.Equal("Test", r.Payload["title"].StringValue));
         }, cts.Token);
@@ -88,7 +88,7 @@ public class QdrantFunctionalTests(ITestOutputHelper testOutputHelper)
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task WithDataShouldPersistStateBetweenUsages(bool useVolume)
     {
         var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
@@ -189,7 +189,7 @@ public class QdrantFunctionalTests(ITestOutputHelper testOutputHelper)
                         {
                             var qdrantClient = host.Services.GetRequiredService<QdrantClient>();
 
-                            var results = await qdrantClient.SearchAsync(CollectionName, s_testVector, limit: 1, cancellationToken: token);
+                            var results = await qdrantClient.QueryAsync(CollectionName, s_testVector, limit: 1, cancellationToken: token);
                             Assert.Collection(results,
                                 r => Assert.Equal("Test", r.Payload["title"].StringValue));
                         }, cts.Token);
@@ -224,7 +224,7 @@ public class QdrantFunctionalTests(ITestOutputHelper testOutputHelper)
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task AddQdrantWithDefaultsAddsUrlAnnotations()
     {
         using var builder = TestDistributedApplicationBuilder.CreateWithTestContainerRegistry(testOutputHelper);
@@ -247,13 +247,13 @@ public class QdrantFunctionalTests(ITestOutputHelper testOutputHelper)
         var urls = qdrant.Resource.Annotations.OfType<ResourceUrlAnnotation>();
         Assert.Single(urls, u => u.Endpoint?.EndpointName == "grpc" && u.DisplayText == "Qdrant (GRPC)" && u.DisplayLocation == UrlDisplayLocation.DetailsOnly);
         Assert.Single(urls, u => u.Endpoint?.EndpointName == "http" && u.DisplayText == "Qdrant (HTTP)");
-        Assert.Single(urls, u => u.DisplayText == "Qdrant Dashboard" && u.Url.EndsWith("/dashboard"));
+        Assert.Single(urls, u => u.DisplayText == "Manage" && u.Url.EndsWith("/dashboard"));
 
         await app.StopAsync();
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyWaitForOnQdrantBlocksDependentResources()
     {
         var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
@@ -290,7 +290,7 @@ public class QdrantFunctionalTests(ITestOutputHelper testOutputHelper)
         await app.StopAsync();
     }
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public Task Qdrant_WithPersistentLifetime_ReusesContainer()
     {
         return PersistentContainerTestHelpers.AssertResourceReusesContainerAsync(

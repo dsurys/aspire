@@ -27,6 +27,7 @@ internal sealed class TestInteractionService : IInteractionService
     public Action<string>? ShowStatusCallback { get; set; }
     public Action<string>? ShowDynamicStatusCallback { get; set; }
     public Action<KnownEmoji, string, ConsoleOutput?>? DisplayMessageCallback { get; set; }
+    public Action<string?, ConsoleOutput?>? DisplayCancellationMessageCallback { get; set; }
     public Action<string>? DisplayVersionUpdateNotificationCallback { get; set; }
     public string? LastVersionUpdateCommand { get; private set; }
 
@@ -57,7 +58,7 @@ internal sealed class TestInteractionService : IInteractionService
     public List<string> DisplayedSuccess { get; } = [];
     public List<string> ShownStatuses { get; } = [];
     public int DisplayEmptyLineCount { get; private set; }
-    public List<ConsoleOutput?> DisplayedCancellations { get; } = [];
+    public List<(string? Message, ConsoleOutput? ConsoleOverride)> DisplayedCancellations { get; } = [];
 
     // Response queue setup methods
     public void SetupStringPromptResponse(string response) => _responses.Enqueue((response, ResponseType.String));
@@ -126,7 +127,7 @@ internal sealed class TestInteractionService : IInteractionService
         return PromptForResponseAsync(validator, binding, cancellationToken);
     }
 
-    public Task<string> PromptForFilePathAsync(string promptText, Func<string, ValidationResult>? validator = null, bool directory = false, bool required = false, PromptBinding<string?>? binding = null, CancellationToken cancellationToken = default)
+    public Task<string> PromptForFilePathAsync(string promptText, Func<string, ValidationResult>? validator = null, bool directory = false, bool required = false, PromptBinding<string?>? binding = null, bool retryOnValidationFailure = false, CancellationToken cancellationToken = default)
     {
         var (wasProvided, value, _) = PromptBinding.Resolve(binding);
         if (wasProvided && value is not null)
@@ -273,12 +274,14 @@ internal sealed class TestInteractionService : IInteractionService
         }
     }
 
-    public void DisplayCancellationMessage(ConsoleOutput? consoleOverride = null)
+    public void DisplayCancellationMessage(string? message = null, ConsoleOutput? consoleOverride = null)
     {
         lock (_displayLock)
         {
-            DisplayedCancellations.Add(consoleOverride);
+            DisplayedCancellations.Add((message, consoleOverride));
         }
+
+        DisplayCancellationMessageCallback?.Invoke(message, consoleOverride);
     }
 
     public Task<bool> PromptConfirmAsync(string promptText, PromptBinding<bool>? binding = null, CancellationToken cancellationToken = default)

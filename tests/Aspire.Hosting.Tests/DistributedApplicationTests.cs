@@ -289,6 +289,10 @@ public class DistributedApplicationTests
             Assert.Equal("http", u.Name);
         });
 
+        await startTask.DefaultTimeout(TestConstants.LongTimeoutTimeSpan);
+        using var serviceAClient = app.CreateHttpClientWithResilience(notStartedResourceName, "http");
+        Assert.Equal("Hello World!", await serviceAClient.GetStringAsync("/", token));
+
         logger.LogInformation("Stop resource.");
         await orchestrator.StopResourceAsync(notStartedResourceEvent.ResourceId, token).DefaultTimeout(TestConstants.LongTimeoutTimeSpan);
         await rns.WaitForResourceAsync(notStartedResourceName, e => e.Snapshot.State?.Text == KnownResourceStates.Finished, token).DefaultTimeout(TestConstants.LongTimeoutTimeSpan);
@@ -296,8 +300,8 @@ public class DistributedApplicationTests
         logger.LogInformation("Start resource again");
         await orchestrator.StartResourceAsync(notStartedResourceEvent.ResourceId, token).DefaultTimeout(TestConstants.LongTimeoutTimeSpan);
         await rns.WaitForResourceAsync(notStartedResourceName, e => e.Snapshot.State?.Text == KnownResourceStates.Running, token).DefaultTimeout(TestConstants.LongTimeoutTimeSpan);
+        Assert.Equal("Hello World!", await serviceAClient.GetStringAsync("/", token));
 
-        await startTask.DefaultTimeout(TestConstants.LongTimeoutTimeSpan);
         await app.StopAsync(token).DefaultTimeout(TestConstants.LongTimeoutTimeSpan);
     }
 
@@ -514,7 +518,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task ExplicitStart_StartContainer()
     {
         const string testName = "explicit-start-container";
@@ -597,7 +601,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task ExplicitStart_StartPersistentContainer()
     {
         foreach (var firstRun in new[] { true, false })
@@ -816,7 +820,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyContainerArgs()
     {
         using var testProgram = CreateTestProgram("verify-container-args");
@@ -844,7 +848,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyContainerCreateFile()
     {
         using var testProgram = CreateTestProgram("verify-container-create-file", trustDeveloperCertificate: false);
@@ -909,7 +913,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyRedisWithCertificateKeyPair()
     {
         const string testName = "verify-redis-with-certificate";
@@ -954,7 +958,7 @@ public class DistributedApplicationTests
     }
 
     [Theory]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     [RequiresFeature(TestFeature.DevCert)]
     [InlineData(false, false, false, false, CertificateTrustScope.Append)]
     [InlineData(false, true, true, false, CertificateTrustScope.Append)]
@@ -1080,7 +1084,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyContainerSucceedsWithCreateFileContinueOnError()
     {
         using var testProgram = CreateTestProgram("verify-container-continue-on-error", trustDeveloperCertificate: false);
@@ -1109,7 +1113,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     [RequiresFeature(TestFeature.DevCert)]
     public async Task VerifyEnvironmentVariablesAvailableInCertificateTrustConfigCallback()
     {
@@ -1155,7 +1159,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyEnvironmentVariablesAppliedWithoutCertificateTrustConfig()
     {
         // Don't apply developer certificate trust so the config callback shouldn't be invoked
@@ -1194,7 +1198,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyContainerStopStartWorks()
     {
         using var testProgram = CreateTestProgram("container-start-stop", randomizePorts: false);
@@ -1264,6 +1268,8 @@ public class DistributedApplicationTests
         var executablePattern = $"{testName}-servicea-{ReplicaIdRegex}-{suffix}";
         var serviceA = await KubernetesHelper.GetResourceByNameMatchAsync<Executable>(kubernetes, executablePattern, r => r.Status?.State == ExecutableState.Running, token).DefaultTimeout(TestConstants.DefaultOrchestratorTestLongTimeout);
         Assert.NotNull(serviceA);
+        using var serviceAClient = app.CreateHttpClientWithResilience(testProgram.ServiceABuilder.Resource.Name, "http");
+        Assert.Equal("Hello World!", await serviceAClient.GetStringAsync("/", token));
 
         await orchestrator.StopResourceAsync(serviceA.Metadata.Name, token).DefaultTimeout(TestConstants.DefaultOrchestratorTestTimeout);
 
@@ -1274,12 +1280,13 @@ public class DistributedApplicationTests
 
         serviceA = await KubernetesHelper.GetResourceByNameMatchAsync<Executable>(kubernetes, executablePattern, r => r.Status?.State == ExecutableState.Running, token).DefaultTimeout(TestConstants.LongTimeoutDuration);
         Assert.NotNull(serviceA);
+        Assert.Equal("Hello World!", await serviceAClient.GetStringAsync("/", token));
 
         await app.StopAsync(token).DefaultTimeout(TestConstants.DefaultOrchestratorTestLongTimeout);
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task SpecifyingEnvPortInEndpointFlowsToEnv()
     {
         const string testName = "ports-flow-to-env";
@@ -1497,7 +1504,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyDockerWithEntrypointWorks()
     {
         const string testName = "docker-entrypoint";
@@ -1524,7 +1531,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyDockerWithBindMountWorksWithAbsolutePaths()
     {
         const string testName = "docker-bindmount-absolute";
@@ -1553,7 +1560,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyDockerWithBindMountWorksWithRelativePaths()
     {
         const string testName = "docker-bindmount-relative";
@@ -1582,7 +1589,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task VerifyDockerWithVolumeWorksWithName()
     {
         const string testName = "docker-volume";
@@ -1606,11 +1613,15 @@ public class DistributedApplicationTests
         Assert.NotEmpty(redisContainer.Spec.VolumeMounts);
         Assert.Equal($"{testName}-volume", redisContainer.Spec.VolumeMounts[0].Source);
 
+        var containerVolume = Assert.Single(await s.ListAsync<ContainerVolume>().DefaultTimeout(TestConstants.DefaultOrchestratorTestLongTimeout));
+        Assert.Equal($"{testName}-volume", containerVolume.Spec.Name);
+        Assert.Equal(ContainerVolumeState.Ready, containerVolume.Status?.State);
+
         await app.StopAsync().DefaultTimeout(TestConstants.DefaultOrchestratorTestLongTimeout);
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task KubernetesHasResourceNameForContainersAndExes()
     {
         const string testName = "kube-resource-names";
@@ -1812,7 +1823,7 @@ public class DistributedApplicationTests
 
     [Fact]
     [OuterloopTest("Long-running container test")]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task ProxylessContainerCanBeReferenced()
     {
         const string testName = "proxyless-container";
@@ -1891,7 +1902,7 @@ public class DistributedApplicationTests
 
     [Fact]
     [OuterloopTest("Long-running endpoint proxy test")]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task WithEndpointProxySupportDisablesProxies()
     {
         const string testName = "endpoint-proxy-support";
@@ -1969,7 +1980,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task ProxylessContainerWithoutPortThrows()
     {
         const string testName = "proxyless-container-without-ports";
@@ -1989,7 +2000,7 @@ public class DistributedApplicationTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task PersistentNetworkCreatedIfPersistentContainers(bool createPersistentContainer)
     {
         const string testName = "persistent-network-if-persistent-containers";
@@ -2021,7 +2032,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task ParentProcessLifetimeScopesExecutableAndContainerToParentProcess()
     {
         const string testName = "parent-process-lifetime-scope";
@@ -2070,7 +2081,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task ParentProcessLifetimeReusesResourcesAcrossAppRestartsAndStopsWhenParentExits()
     {
         const string testName = "parent-process-lifetime-reuse";
@@ -2188,7 +2199,7 @@ public class DistributedApplicationTests
     }
 
     [Fact]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     public async Task AfterResourcesCreatedLifecycleHookWorks()
     {
         const string testName = "lifecycle-hook-after-resource-created";
@@ -2281,7 +2292,7 @@ public class DistributedApplicationTests
     }
 
     [Theory]
-    [RequiresFeature(TestFeature.Docker)]
+    [RequiresFeature(TestFeature.ContainerRuntime)]
     [InlineData(0)] // Success exit code
     [InlineData(100)] // Failing (non-zero) exit code
     public async Task ContainerExitsImmediatelyAfterStart(int exitCode)

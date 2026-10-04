@@ -16,6 +16,9 @@ internal static class DashboardConfigNames
     public static readonly ConfigName DashboardAspireApiDisabledName = new(KnownConfigNames.DashboardApiDisabled);
     public static readonly ConfigName ResourceServiceUrlName = new(KnownConfigNames.ResourceServiceEndpointUrl);
     public static readonly ConfigName ForwardedHeaders = new(KnownConfigNames.DashboardForwardedHeadersEnabled);
+    public static readonly ConfigName DashboardApplicationName = new("Dashboard:ApplicationName", "ASPIRE_DASHBOARD_APPLICATION_NAME");
+    public static readonly ConfigName DashboardDataDirectoryName = new("Dashboard:Data:Directory", "ASPIRE_DASHBOARD_DATA_DIRECTORY");
+    public static readonly ConfigName DashboardPersistenceModeName = new("Dashboard:Data:PersistenceMode", "ASPIRE_DASHBOARD_PERSISTENCE_MODE");
 
     public static readonly ConfigName DashboardOtlpAuthModeName = new("Dashboard:Otlp:AuthMode", "DASHBOARD__OTLP__AUTHMODE");
     public static readonly ConfigName DashboardOtlpPrimaryApiKeyName = new("Dashboard:Otlp:PrimaryApiKey", "DASHBOARD__OTLP__PRIMARYAPIKEY");
@@ -36,6 +39,7 @@ internal static class DashboardConfigNames
     public static readonly ConfigName DashboardFrontendBrowserTokenName = new("Dashboard:Frontend:BrowserToken", "DASHBOARD__FRONTEND__BROWSERTOKEN");
     public static readonly ConfigName DashboardFrontendMaxConsoleLogCountName = new("Dashboard:Frontend:MaxConsoleLogCount", "DASHBOARD__FRONTEND__MAXCONSOLELOGCOUNT");
     public static readonly ConfigName DashboardFrontendPublicUrlName = new("Dashboard:Frontend:PublicUrl", "DASHBOARD__FRONTEND__PUBLICURL");
+    public static readonly ConfigName DashboardFrontendDisableWebSocketCompressionName = new("Dashboard:Frontend:DisableWebSocketCompression", "DASHBOARD__FRONTEND__DISABLEWEBSOCKETCOMPRESSION");
     public static readonly ConfigName ResourceServiceClientAuthModeName = new("Dashboard:ResourceServiceClient:AuthMode", "DASHBOARD__RESOURCESERVICECLIENT__AUTHMODE");
     public static readonly ConfigName ResourceServiceClientCertificateSourceName = new("Dashboard:ResourceServiceClient:ClientCertificate:Source", "DASHBOARD__RESOURCESERVICECLIENT__CLIENTCERTIFICATE__SOURCE");
     public static readonly ConfigName ResourceServiceClientCertificateFilePathName = new("Dashboard:ResourceServiceClient:ClientCertificate:FilePath", "DASHBOARD__RESOURCESERVICECLIENT__CLIENTCERTIFICATE__FILEPATH");

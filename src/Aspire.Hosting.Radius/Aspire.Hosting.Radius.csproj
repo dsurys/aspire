@@ -22,10 +22,13 @@
   <ItemGroup>
     <ProjectReference Include="..\Aspire.Hosting\Aspire.Hosting.csproj" />
     <PackageReference Include="Azure.Provisioning" />
+    <PackageReference Include="YamlDotNet" />
   </ItemGroup>
 
   <ItemGroup>
     <Compile Include="$(SharedDir)PublishingContextUtils.cs" LinkBase="Shared" />
+    <Compile Include="$(SharedDir)EnvironmentVariableNameEncoder.cs" LinkBase="Shared" />
+    <Compile Include="$(SharedDir)Model\KnownRelationshipTypes.cs" LinkBase="Shared" />
   </ItemGroup>
 
   <ItemGroup>

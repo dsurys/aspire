@@ -37,11 +37,31 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
     private readonly DcpResourceState _resourceState;
     private readonly ResourceSnapshotBuilder _snapshotBuilder;
 
-    private readonly ConcurrentDictionary<string, (CancellationTokenSource Cancellation, Task Task)> _logStreams = new();
-    private readonly ConcurrentDictionary<string, PendingFollowLogDeduplication> _pendingFollowLogDeduplications = new();
+    private readonly ConcurrentDictionary<string, LogStreamState> _logStreams = new();
+    private readonly Dictionary<string, PendingFollowLogDeduplication> _pendingFollowLogDeduplications = [];
+    private readonly object _pendingFollowLogDeduplicationsLock = new();
+
+    // Last identity and resource version seen for each DCP object, keyed by (object kind, object name).
+    // The stable key avoids retaining stale entries when a delete is missed, while the UID distinguishes
+    // a recreated object from an unchanged watch replay. See ProcessResourceChange.
+    private readonly ConcurrentDictionary<(string Kind, string Name), ObservedResource> _observedResources = new();
+    // Service and endpoint watches can read this map while a resource restart marks another kind.
+    // Only the immediately previous UID is retained. An event delayed across multiple serialized
+    // restarts could therefore be accepted, but retaining every historical UID would grow this map
+    // for the lifetime of the AppHost. DCP watches normally deliver deletion events promptly enough
+    // that this bounded tradeoff is preferable.
+    private readonly ConcurrentDictionary<(string Kind, string Name), string> _supersededResourceUids = new();
+    private readonly object _incarnationLock = new();
+    private readonly SemaphoreSlim _outputSemaphore = new(1);
+
+    // Holds names of resources that reached terminal state and logs have already been flushed for them.
+    // Prevents re-reading DCP's log store every time an already-terminal resource is reported again.
+    // Point-in-time FailedToStart reads and incomplete attempts are intentionally not recorded so a later changed
+    // terminal notification can retry them. Unchanged watch replays are suppressed before reaching this path.
+    private readonly ConcurrentDictionary<string, bool> _allLogsFlushed = new();
     private Task? _resourceWatchTask;
 
-    private readonly record struct LogInformationEntry(string ResourceName, bool? LogsAvailable, bool? HasSubscribers);
+    private readonly record struct LogInformationEntry(string ResourceName, bool? LogsAvailable, bool? HasSubscribers, bool ShouldStartStream);
     private readonly Channel<LogInformationEntry> _logInformationChannel = Channel.CreateUnbounded<LogInformationEntry>(
         new UnboundedChannelOptions { SingleReader = true });
 
@@ -49,6 +69,48 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
     internal ResiliencePipeline WatchResourceRetryPipeline { get; set; }
 
     internal ResourceSnapshotBuilder SnapshotBuilder => _snapshotBuilder;
+
+    // Internal for testing.
+    internal Task? GetLogStreamTask(string resourceName)
+    {
+        return _logStreams.TryGetValue(resourceName, out var logStream) ? logStream.Task : null;
+    }
+
+    // Internal for testing.
+    internal bool HasLogStreamPendingDeduplication(string resourceName)
+    {
+        lock (_pendingFollowLogDeduplicationsLock)
+        {
+            return _logStreams.TryGetValue(resourceName, out var logStream) &&
+                logStream.PendingDeduplication is not null;
+        }
+    }
+
+    // Internal for testing.
+    internal Func<string?, ValueTask>? BeforeLogBatchDeliveryAsync { get; set; }
+
+    internal void MarkPreviousIncarnationSuperseded(string kind, string name, string? uid)
+    {
+        // Resource-stopped callbacks run under the watcher's output semaphore and may restart
+        // their resource. Only synchronize UID state here, not the callbacks that publish it.
+        lock (_incarnationLock)
+        {
+            var key = (kind, name);
+            if (string.IsNullOrEmpty(uid) && _observedResources.TryGetValue(key, out var previous))
+            {
+                uid = previous.Uid;
+            }
+
+            if (string.IsNullOrEmpty(uid))
+            {
+                return;
+            }
+
+            // Deleting a DCP object does not drain its watch. A final status update from the
+            // old UID may arrive after the replacement's Starting state was published.
+            _supersededResourceUids[key] = uid;
+        }
+    }
 
     public DcpResourceWatcher(
         ILogger logger,
@@ -84,12 +146,10 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
 
     public void Start()
     {
-        var outputSemaphore = new SemaphoreSlim(1);
-
         var cancellationToken = _shutdownToken;
         var watchResourcesTask = Task.Run(async () =>
         {
-            using (outputSemaphore)
+            using (_outputSemaphore)
             {
                 await Task.WhenAll(
                     Task.Run(() => WatchKubernetesResourceAsync<Executable>((t, r) => ProcessResourceChange(t, r, _resourceState.ExecutablesMap, Model.Dcp.ExecutableKind, (e, s) => _snapshotBuilder.ToSnapshot(e, s)))),
@@ -106,7 +166,7 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
         {
             await foreach (var subscribers in _loggerService.WatchAnySubscribersAsync(cancellationToken).ConfigureAwait(false))
             {
-                _logInformationChannel.Writer.TryWrite(new(subscribers.Name, LogsAvailable: null, subscribers.AnySubscribers));
+                _logInformationChannel.Writer.TryWrite(new(subscribers.Name, LogsAvailable: null, subscribers.AnySubscribers, ShouldStartStream: true));
             }
         });
 
@@ -137,25 +197,25 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
                 {
                     if (hasSubscribers)
                     {
-                        if (_resourceState.ContainersMap.TryGetValue(entry.ResourceName, out var container))
+                        if (entry.ShouldStartStream)
                         {
-                            StartLogStream(container);
-                        }
-                        else if (_resourceState.ExecutablesMap.TryGetValue(entry.ResourceName, out var executable))
-                        {
-                            StartLogStream(executable);
-                        }
-                        else if (_resourceState.ContainerExecsMap.TryGetValue(entry.ResourceName, out var containerExec))
-                        {
-                            StartLogStream(containerExec);
+                            if (_resourceState.ContainersMap.TryGetValue(entry.ResourceName, out var container))
+                            {
+                                StartLogStream(container);
+                            }
+                            else if (_resourceState.ExecutablesMap.TryGetValue(entry.ResourceName, out var executable))
+                            {
+                                StartLogStream(executable);
+                            }
+                            else if (_resourceState.ContainerExecsMap.TryGetValue(entry.ResourceName, out var containerExec))
+                            {
+                                StartLogStream(containerExec);
+                            }
                         }
                     }
                     else
                     {
-                        if (_logStreams.TryRemove(entry.ResourceName, out var logStream))
-                        {
-                            logStream.Cancellation.Cancel();
-                        }
+                        CancelLogStream(entry.ResourceName);
                     }
                 }
 
@@ -174,7 +234,7 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
                 {
                     await foreach (var (eventType, resource) in _kubernetesService.WatchAsync<T>(cancellationToken: pipelineCancellationToken).ConfigureAwait<(global::k8s.WatchEventType, T)>(false))
                     {
-                        await outputSemaphore.WaitAsync(pipelineCancellationToken).ConfigureAwait(false);
+                        await _outputSemaphore.WaitAsync(pipelineCancellationToken).ConfigureAwait(false);
 
                         try
                         {
@@ -182,7 +242,7 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
                         }
                         finally
                         {
-                            outputSemaphore.Release();
+                            _outputSemaphore.Release();
                         }
                     }
                 }, cancellationToken).ConfigureAwait(false);
@@ -211,10 +271,10 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
             tasks.Add(resourceTask);
         }
 
-        foreach (var (_, (cancellation, logTask)) in _logStreams)
+        foreach (var (_, logStream) in _logStreams)
         {
-            cancellation.Cancel();
-            tasks.Add(logTask);
+            logStream.Cancel();
+            tasks.Add(logStream.Task);
         }
 
         try
@@ -239,8 +299,23 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
 
     private async Task ProcessResourceChange<T>(WatchEventType watchEventType, T resource, ConcurrentDictionary<string, T> resourceByName, string resourceKind, Func<T, CustomResourceSnapshot, CustomResourceSnapshot> snapshotFactory) where T : CustomResource, IKubernetesStaticMetadata
     {
-        if (ProcessResourceChange(resourceByName, watchEventType, resource))
+        // Read the DCP state before replacing the cached object. The published snapshot can
+        // already say Waiting or Starting if a stopped handler has requested a restart.
+        var previousState = resourceByName.TryGetValue(resource.Metadata.Name, out var previousResource)
+            ? GetResourceStatus(previousResource).State
+            : null;
+        ResourceChangeResult resourceChange;
+        lock (_incarnationLock)
         {
+            resourceChange = ProcessResourceChange(resourceByName, watchEventType, resource);
+        }
+        if (resourceChange != ResourceChangeResult.Ignored)
+        {
+            if (resourceChange is ResourceChangeResult.Deleted or ResourceChangeResult.Replaced)
+            {
+                ResetResourceLogState(resource.Metadata.Name);
+            }
+
             UpdateAssociatedServicesMap();
 
             var changeType = watchEventType switch
@@ -258,14 +333,6 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
             {
                 if (changeType == ResourceSnapshotChangeType.Delete)
                 {
-                    // Stop the log stream for the resource
-                    if (_logStreams.TryRemove(resource.Metadata.Name, out var logStream))
-                    {
-                        logStream.Cancellation.Cancel();
-                    }
-
-                    _pendingFollowLogDeduplications.TryRemove(resource.Metadata.Name, out _);
-
                     // TODO: Handle resource deletion
                     if (_logger.IsEnabled(LogLevel.Trace))
                     {
@@ -292,20 +359,62 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
                     //
                     // Only do this when a subscriber is active. Without subscribers there is no caller
                     // depending on the ordering, and GetAllAsync can still query DCP's external log
-                    // store later without this extra read on every terminal transition.
-                    if (HasLogsAvailable(resource) &&
-                        status.State is not null &&
-                        KnownResourceStates.TerminalStates.Contains(status.State) &&
-                        _loggerService.HasActiveSubscribers(resource.Metadata.Name))
+                    // store later without this extra read on every terminal transition. If a subscriber
+                    // attaches later, the subscriber information path starts the normal DCP follow stream.
+                    //
+                    // A successfully completed follow stream needs to run only once per terminal period.
+                    // The flush is awaited while holding the watcher's single output semaphore, so repeating
+                    // a completed flush would stall all resource watches. A later changed terminal notification
+                    // can retry point-in-time FailedToStart reads and incomplete attempts because they are not
+                    // recorded as complete. The marker is cleared below if the resource is restarted.
+                    var logsAvailable = HasLogsAvailable(resource);
+                    var isTerminal = status.State is not null && KnownResourceStates.TerminalStates.Contains(status.State);
+                    if (isTerminal)
                     {
-                        await FlushCurrentLogsAsync(resource, status, _shutdownToken).ConfigureAwait(false);
+                        if (logsAvailable &&
+                            _loggerService.HasActiveSubscribers(resource.Metadata.Name) &&
+                            !_allLogsFlushed.ContainsKey(resource.Metadata.Name))
+                        {
+                            var completed = await FlushCurrentLogsAsync(resource, status, _shutdownToken).ConfigureAwait(false);
+                            if (completed)
+                            {
+                                _allLogsFlushed.TryAdd(resource.Metadata.Name, true);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        _allLogsFlushed.TryRemove(resource.Metadata.Name, out _);
                     }
 
-                    await _executorEvents.PublishAsync(new OnResourceChangedContext(_shutdownToken, resourceType, appModelResource, resource.Metadata.Name, status, s => snapshotFactory(resource, s))).ConfigureAwait(false);
-
-                    if (HasLogsAvailable(resource))
+                    Task publishTask;
+                    lock (_incarnationLock)
                     {
-                        _logInformationChannel.Writer.TryWrite(new(resource.Metadata.Name, LogsAvailable: true, HasSubscribers: null));
+                        // Log flushing can yield while a restart supersedes this UID. PublishAsync
+                        // updates the snapshot synchronously before invoking resource-stopped callbacks,
+                        // so keep that publication atomic with marking the old UID.
+                        if (IsSuperseded(resourceKind, resource.Metadata.Name, resource.Metadata.Uid))
+                        {
+                            return;
+                        }
+
+                        publishTask = _executorEvents.PublishAsync(new OnResourceChangedContext(_shutdownToken, resourceType, appModelResource, resource.Metadata.Name, status,
+                            resourceChange == ResourceChangeResult.Replaced ? null : previousState,
+                            s => snapshotFactory(resource, s)));
+                    }
+
+                    await publishTask.ConfigureAwait(false);
+
+                    if (logsAvailable)
+                    {
+                        // Avoid opening a second follow stream only after a terminal follow flush completed. Timed-out
+                        // flushes and point-in-time FailedToStart reads leave the normal stream startable so an existing
+                        // subscriber can receive later logs without another subscriber change or resource notification.
+                        // A replacement still needs its own stream after its old registration was reset.
+                        var shouldStartStream =
+                            resourceChange == ResourceChangeResult.Replaced ||
+                            !_allLogsFlushed.ContainsKey(resource.Metadata.Name);
+                        _logInformationChannel.Writer.TryWrite(new(resource.Metadata.Name, LogsAvailable: true, HasSubscribers: null, ShouldStartStream: shouldStartStream));
                     }
                 }
             }
@@ -339,10 +448,41 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
         }
     }
 
-    private async Task FlushCurrentLogsAsync<T>(T resource, ResourceStatus status, CancellationToken cancellationToken)
+    private void ResetResourceLogState(string resourceName)
+    {
+        var logStream = CancelLogStream(resourceName);
+
+        lock (_pendingFollowLogDeduplicationsLock)
+        {
+            _pendingFollowLogDeduplications.Remove(resourceName);
+            logStream?.PendingDeduplication = null;
+        }
+
+        _allLogsFlushed.TryRemove(resourceName, out _);
+    }
+
+    private LogStreamState? CancelLogStream(string resourceName)
+    {
+        if (_logStreams.TryGetValue(resourceName, out var logStream))
+        {
+            // Keep this registration until cancellation has synchronized with any synchronous batch
+            // delivery. Otherwise another stream can claim the same name while the old stream is
+            // still publishing a batch that ResourceLogSource yielded before cancellation.
+            logStream.Cancel();
+            _logStreams.TryRemove(new(resourceName, logStream));
+            return logStream;
+        }
+
+        return null;
+    }
+
+    private async Task<bool> FlushCurrentLogsAsync<T>(T resource, ResourceStatus status, CancellationToken cancellationToken)
         where T : CustomResource, IKubernetesStaticMetadata
     {
         var logEntries = new List<LogEntry>();
+        var follow = status.State != KnownResourceStates.FailedToStart;
+        var completed = false;
+
         // The resource watcher serializes all resource-change handling through one semaphore in
         // Start(). A follow stream gives the strongest DCP guarantee for terminal logs, but it is
         // still an external stream: if DCP stalls or the resource disappears mid-stream, waiting
@@ -359,10 +499,9 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
             // race with DCP's own cleanup/log-drain work.
             //
             // FailedToStart is different: the process never starts, so there may be no completing
-            // process log stream to follow. DCP emits the system failure logs before the FailedToStart
-            // state is observed, so use a current snapshot there to avoid blocking terminal state
-            // publication indefinitely.
-            var follow = status.State != KnownResourceStates.FailedToStart;
+            // process log stream to follow. Use a current snapshot there to avoid blocking terminal
+            // state publication indefinitely. A later changed terminal notification retries the
+            // snapshot because, unlike a completed follow stream, it cannot prove all logs were drained.
             var logSource = new ResourceLogSource<T>(_logger, _kubernetesService, resource, follow: follow);
 
             // Treat the flush as best-effort: logs collected before the timeout are still forwarded
@@ -371,6 +510,11 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
             {
                 logEntries.AddRange(CreateLogEntries(batch));
             }
+
+            // ResourceLogSource treats cancellation as an expected stream shutdown, so explicitly
+            // distinguish that from DCP completing every follow stream.
+            timeoutCts.Token.ThrowIfCancellationRequested();
+            completed = true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -392,8 +536,11 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
         // These logs came from DCP's external log store, not in-process ILogger. Do not store
         // them as in-memory entries; otherwise GetAllAsync would replay them before querying
         // the same DCP log source again.
-        SetPendingFollowLogDeduplication(resource.Metadata.Name, logEntries);
+        SetPendingFollowLogDeduplication(resource.Metadata.Name, resource.Metadata.Uid, logEntries);
         _loggerService.AddLogEntries(resource.Metadata.Name, logEntries, inMemorySource: false, skipExisting: true);
+
+        // Only normal completion of a follow stream proves DCP has no more logs to deliver.
+        return follow && completed;
     }
 
     private static bool HasLogsAvailable(CustomResource resource)
@@ -514,13 +661,27 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
             return;
         }
 
-        // This does not run concurrently for the same resource so we can safely use GetOrAdd without
-        // creating multiple log streams.
-        _logStreams.GetOrAdd(resource.Metadata.Name, resourceName =>
-        {
-            var cancellation = new CancellationTokenSource();
+        var resourceName = resource.Metadata.Name;
+        var logStream = new LogStreamState(resource.Metadata.Uid);
+        var cancellationToken = logStream.CancellationToken;
 
-            var task = Task.Run(async () =>
+        try
+        {
+            // Registration and pending-state observation must be atomic with cleanup. Otherwise a
+            // canceled stream can remove the pending state after this stream registers but before it
+            // adopts that state, allowing replayed terminal-flush lines through.
+            lock (_pendingFollowLogDeduplicationsLock)
+            {
+                if (!_logStreams.TryAdd(resourceName, logStream))
+                {
+                    logStream.Dispose();
+                    return;
+                }
+
+                ObservePendingFollowLogDeduplication(resourceName, logStream);
+            }
+
+            _ = Task.Run(async () =>
             {
                 try
                 {
@@ -529,11 +690,19 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
                         _logger.LogDebug("Starting log streaming for {ResourceName}.", resourceName);
                     }
 
-                    await foreach (var batch in enumerable.WithCancellation(cancellation.Token).ConfigureAwait(false))
+                    await foreach (var batch in enumerable.WithCancellation(cancellationToken).ConfigureAwait(false))
                     {
                         var logEntries = CreateLogEntries(batch).ToList();
-                        logEntries = DeduplicateFollowBatch(resourceName, logEntries);
-                        _loggerService.AddLogEntries(resourceName, logEntries, inMemorySource: false, skipExisting: false);
+                        if (BeforeLogBatchDeliveryAsync is { } beforeLogBatchDeliveryAsync)
+                        {
+                            await beforeLogBatchDeliveryAsync(logStream.ResourceUid).ConfigureAwait(false);
+                        }
+
+                        logStream.TryDeliver(() =>
+                        {
+                            logEntries = DeduplicateFollowBatch(resourceName, logStream, logEntries);
+                            _loggerService.AddLogEntries(resourceName, logEntries, inMemorySource: false, skipExisting: false);
+                        });
                     }
                 }
                 catch (OperationCanceledException)
@@ -552,20 +721,49 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
                 }
                 finally
                 {
-                    _pendingFollowLogDeduplications.TryRemove(resourceName, out _);
+                    try
+                    {
+                        try
+                        {
+                            RemovePendingFollowLogDeduplication(resourceName, logStream);
+                        }
+                        finally
+                        {
+                            // Remove only this registration. A canceled stream can finish after a
+                            // replacement stream has registered under the same resource name.
+                            // LogStreamState intentionally retains reference equality so this
+                            // KeyValuePair overload performs an atomic identity-based removal.
+                            _logStreams.TryRemove(new(resourceName, logStream));
+                        }
+                    }
+                    finally
+                    {
+                        logStream.Dispose();
+                    }
                 }
-            },
-            cancellation.Token);
-
-            return (cancellation, task);
-        });
+            });
+        }
+        catch
+        {
+            _logStreams.TryRemove(new(resourceName, logStream));
+            logStream.Dispose();
+            throw;
+        }
     }
 
-    private void SetPendingFollowLogDeduplication(string resourceName, IReadOnlyList<LogEntry> flushedLogEntries)
+    private void SetPendingFollowLogDeduplication(string resourceName, string? resourceUid, IReadOnlyList<LogEntry> flushedLogEntries)
     {
         if (flushedLogEntries.Count == 0)
         {
-            _pendingFollowLogDeduplications.TryRemove(resourceName, out _);
+            lock (_pendingFollowLogDeduplicationsLock)
+            {
+                if (_pendingFollowLogDeduplications.TryGetValue(resourceName, out var pendingDeduplication) &&
+                    HasSameResourceIdentity(pendingDeduplication.ResourceUid, resourceUid))
+                {
+                    RemovePendingFollowLogDeduplication(resourceName, pendingDeduplication);
+                }
+            }
+
             return;
         }
 
@@ -591,72 +789,191 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
             }
         }
 
-        _pendingFollowLogDeduplications[resourceName] = new(counts, latestTimestamp, remainingCount);
+        var newPendingDeduplication = new PendingFollowLogDeduplication(resourceUid, counts, latestTimestamp, remainingCount);
+        lock (_pendingFollowLogDeduplicationsLock)
+        {
+            _pendingFollowLogDeduplications[resourceName] = newPendingDeduplication;
+            if (_logStreams.TryGetValue(resourceName, out var logStream) &&
+                HasSameResourceIdentity(logStream.ResourceUid, resourceUid))
+            {
+                logStream.PendingDeduplication = newPendingDeduplication;
+            }
+        }
     }
 
-    private List<LogEntry> DeduplicateFollowBatch(string resourceName, List<LogEntry> logEntries)
+    private void ObservePendingFollowLogDeduplication(string resourceName, LogStreamState logStream)
     {
-        if (!_pendingFollowLogDeduplications.TryGetValue(resourceName, out var pendingDeduplication))
-        {
-            return logEntries;
-        }
+        Debug.Assert(Monitor.IsEntered(_pendingFollowLogDeduplicationsLock));
 
-        List<LogEntry>? addedEntries = null;
-        foreach (var logEntry in logEntries)
+        if (_pendingFollowLogDeduplications.TryGetValue(resourceName, out var pendingDeduplication) &&
+            HasSameResourceIdentity(pendingDeduplication.ResourceUid, logStream.ResourceUid))
         {
-            // Consume at most one pending occurrence per matching entry. If a flushed snapshot
-            // contained the same line twice, the follow stream must replay it twice before both
-            // copies are treated as overlap.
-            var key = LogEntryKey.Create(logEntry);
-            if (pendingDeduplication.Counts.TryGetValue(key, out var count) && count > 0)
+            logStream.PendingDeduplication = pendingDeduplication;
+        }
+    }
+
+    private List<LogEntry> DeduplicateFollowBatch(string resourceName, LogStreamState logStream, List<LogEntry> logEntries)
+    {
+        lock (_pendingFollowLogDeduplicationsLock)
+        {
+            if (!_pendingFollowLogDeduplications.TryGetValue(resourceName, out var pendingDeduplication) ||
+                !HasSameResourceIdentity(pendingDeduplication.ResourceUid, logStream.ResourceUid))
             {
-                pendingDeduplication.Counts[key] = count - 1;
-                pendingDeduplication.RemainingCount--;
-                continue;
+                return logEntries;
             }
 
-            addedEntries ??= [];
-            addedEntries.Add(logEntry);
-        }
+            logStream.PendingDeduplication = pendingDeduplication;
 
-        // Terminal-state snapshots can overlap with the follow stream, but only around the flush.
-        // Deduplicate against the flushed snapshot itself instead of rebuilding the full backlog
-        // for every follow batch for the lifetime of a chatty resource. DCP log timestamps are
-        // monotonic enough for this boundary: once the follow stream yields a newer timestamp, it
-        // has moved past the overlap window. Timestamp-less entries cannot establish that boundary,
-        // so drop the pending state after the first such batch to avoid suppressing future repeated
-        // messages that happen to have the same content.
-        if (pendingDeduplication.LatestTimestamp is null ||
-            pendingDeduplication.RemainingCount == 0 ||
-            logEntries.Any(entry => entry.Timestamp is null || entry.Timestamp > pendingDeduplication.LatestTimestamp.Value))
+            List<LogEntry>? addedEntries = null;
+            foreach (var logEntry in logEntries)
+            {
+                // Consume at most one pending occurrence per matching entry. If a flushed snapshot
+                // contained the same line twice, the follow stream must replay it twice before both
+                // copies are treated as overlap.
+                var key = LogEntryKey.Create(logEntry);
+                if (pendingDeduplication.Counts.TryGetValue(key, out var count) && count > 0)
+                {
+                    pendingDeduplication.Counts[key] = count - 1;
+                    pendingDeduplication.RemainingCount--;
+                    continue;
+                }
+
+                addedEntries ??= [];
+                addedEntries.Add(logEntry);
+            }
+
+            // Terminal-state snapshots can overlap with the follow stream, but only around the flush.
+            // Deduplicate against the flushed snapshot itself instead of rebuilding the full backlog
+            // for every follow batch for the lifetime of a chatty resource. DCP log timestamps are
+            // monotonic enough for this boundary: once the follow stream yields a newer timestamp, it
+            // has moved past the overlap window. Timestamp-less entries cannot establish that boundary,
+            // so drop the pending state after the first such batch to avoid suppressing future repeated
+            // messages that happen to have the same content.
+            if (pendingDeduplication.LatestTimestamp is null ||
+                pendingDeduplication.RemainingCount == 0 ||
+                logEntries.Any(entry => entry.Timestamp is null || entry.Timestamp > pendingDeduplication.LatestTimestamp.Value))
+            {
+                RemovePendingFollowLogDeduplication(resourceName, pendingDeduplication);
+            }
+
+            return addedEntries ?? [];
+        }
+    }
+
+    private void RemovePendingFollowLogDeduplication(string resourceName, LogStreamState logStream)
+    {
+        lock (_pendingFollowLogDeduplicationsLock)
         {
-            _pendingFollowLogDeduplications.TryRemove(resourceName, out _);
+            if (logStream.PendingDeduplication is { } pendingDeduplication)
+            {
+                // A new same-UID stream can adopt the same pending object after cancellation removes
+                // this stream from _logStreams but before this cleanup runs. In that case ownership has
+                // transferred, so the canceled stream must detach without removing the shared state.
+                var handedOffToCurrentStream =
+                    _logStreams.TryGetValue(resourceName, out var currentLogStream) &&
+                    !ReferenceEquals(currentLogStream, logStream) &&
+                    ReferenceEquals(currentLogStream.PendingDeduplication, pendingDeduplication);
+
+                if (!handedOffToCurrentStream)
+                {
+                    RemovePendingFollowLogDeduplication(resourceName, pendingDeduplication);
+                }
+
+                logStream.PendingDeduplication = null;
+            }
+        }
+    }
+
+    private void RemovePendingFollowLogDeduplication(string resourceName, PendingFollowLogDeduplication pendingDeduplication)
+    {
+        Debug.Assert(Monitor.IsEntered(_pendingFollowLogDeduplicationsLock));
+
+        // Remove only the exact state observed by this stream. A canceled stream from a previous object
+        // incarnation can finish after its replacement has already installed new deduplication state.
+        if (_pendingFollowLogDeduplications.TryGetValue(resourceName, out var currentDeduplication) &&
+            ReferenceEquals(currentDeduplication, pendingDeduplication))
+        {
+            _pendingFollowLogDeduplications.Remove(resourceName);
         }
 
-        return addedEntries ?? [];
+        // The dictionary owns the deduplication state. The current stream retains the same reference
+        // so exact-object removal can clear both places without affecting a newer terminal flush.
+        if (_logStreams.TryGetValue(resourceName, out var logStream) &&
+            ReferenceEquals(logStream.PendingDeduplication, pendingDeduplication))
+        {
+            logStream.PendingDeduplication = null;
+        }
     }
 
     private async Task ProcessEndpointChange(WatchEventType watchEventType, Endpoint endpoint)
     {
-        if (!ProcessResourceChange(_resourceState.EndpointsMap, watchEventType, endpoint))
+        if (ProcessResourceChange(_resourceState.EndpointsMap, watchEventType, endpoint) == ResourceChangeResult.Ignored)
         {
             return;
         }
 
-        if (endpoint.Metadata.OwnerReferences is null)
+        if (endpoint.Metadata.OwnerReferences is not null)
+        {
+            foreach (var ownerReference in endpoint.Metadata.OwnerReferences)
+            {
+                await TryRefreshResource(ownerReference.Kind, ownerReference.Name).ConfigureAwait(false);
+            }
+        }
+
+        // A resource can display a URL for an endpoint owned by a different resource (see
+        // ResourceUrlAnnotation.Endpoint and the cross-resource URL handling in ResourceSnapshotBuilder.GetUrls).
+        // The refresh above only covers the endpoint's owning resource, so resources that merely reference the
+        // endpoint would otherwise never learn that it became active/inactive and their URL would get stuck.
+        await RefreshResourcesReferencingEndpoint(endpoint).ConfigureAwait(false);
+    }
+
+    private async Task RefreshResourcesReferencingEndpoint(Endpoint endpoint)
+    {
+        // Resolved from AppResources rather than ServicesMap: AppResources is built synchronously from the app
+        // model before the resource watcher starts, so it can't race against the separate Service watch loop
+        // that populates ServicesMap.
+        var service = endpoint.Spec.ServiceName is { } serviceName
+            ? _resourceState.AppResources.OfType<ServiceWithModelResource>().Select(s => s.Service).FirstOrDefault(s => s.Metadata.Name == serviceName)
+            : null;
+
+        if (service is null ||
+            service.AppModelResourceName is not { } endpointOwnerResourceName ||
+            service.EndpointName is not { } endpointName)
         {
             return;
         }
 
-        foreach (var ownerReference in endpoint.Metadata.OwnerReferences)
+        foreach (var (resourceName, resource) in _resourceState.ApplicationModel)
         {
-            await TryRefreshResource(ownerReference.Kind, ownerReference.Name).ConfigureAwait(false);
+            if (StringComparers.ResourceName.Equals(resourceName, endpointOwnerResourceName))
+            {
+                // The owning resource was already refreshed above.
+                continue;
+            }
+
+            if (!resource.TryGetUrls(out var urls) ||
+                !urls.Any(u => u.Endpoint is { } e &&
+                    StringComparers.ResourceName.Equals(e.Resource.Name, endpointOwnerResourceName) &&
+                    string.Equals(e.EndpointName, endpointName, StringComparisons.EndpointAnnotationName)))
+            {
+                continue;
+            }
+
+            foreach (var appResource in _resourceState.AppResources)
+            {
+                if (appResource is IResourceReference reference &&
+                    reference is not ServiceWithModelResource &&
+                    StringComparers.ResourceName.Equals(reference.ModelResource.Name, resourceName))
+                {
+                    await TryRefreshResource(appResource.DcpResourceKind, appResource.DcpResourceName).ConfigureAwait(false);
+                }
+            }
         }
     }
 
     private async Task ProcessServiceChange(WatchEventType watchEventType, Service service)
     {
-        if (!ProcessResourceChange(_resourceState.ServicesMap, watchEventType, service))
+        if (ProcessResourceChange(_resourceState.ServicesMap, watchEventType, service) == ResourceChangeResult.Ignored)
         {
             return;
         }
@@ -689,56 +1006,232 @@ internal sealed class DcpResourceWatcher : IConsoleLogsService, IAsyncDisposable
             if (appModelResourceName is not null &&
                 _resourceState.ApplicationModel.TryGetValue(appModelResourceName, out var appModelResource))
             {
-                var status = GetResourceStatus(cr);
-                await _executorEvents.PublishAsync(new OnResourceChangedContext(_shutdownToken, resourceKind, appModelResource, resourceName, status, s =>
+                Task publishTask;
+                lock (_incarnationLock)
                 {
-                    if (cr is Container container)
+                    // An endpoint or service change can refresh a cached workload after its UID
+                    // was superseded but before the workload watch receives its delete event.
+                    if (IsSuperseded(resourceKind, resourceName, cr.Metadata.Uid))
                     {
-                        return _snapshotBuilder.ToSnapshot(container, s);
+                        return;
                     }
-                    else if (cr is Executable exe)
+
+                    var status = GetResourceStatus(cr);
+                    publishTask = _executorEvents.PublishAsync(new OnResourceChangedContext(_shutdownToken, resourceKind, appModelResource, resourceName, status, status.State, s =>
                     {
-                        return _snapshotBuilder.ToSnapshot(exe, s);
-                    }
-                    else if (cr is ContainerExec containerExec)
-                    {
-                        return _snapshotBuilder.ToSnapshot(containerExec, s);
-                    }
-                    return s;
-                })).ConfigureAwait(false);
+                        if (cr is Container container)
+                        {
+                            return _snapshotBuilder.ToSnapshot(container, s);
+                        }
+                        else if (cr is Executable exe)
+                        {
+                            return _snapshotBuilder.ToSnapshot(exe, s);
+                        }
+                        else if (cr is ContainerExec containerExec)
+                        {
+                            return _snapshotBuilder.ToSnapshot(containerExec, s);
+                        }
+                        return s;
+                    }));
+                }
+
+                await publishTask.ConfigureAwait(false);
             }
         }
     }
 
-    private static bool ProcessResourceChange<T>(ConcurrentDictionary<string, T> map, WatchEventType watchEventType, T resource)
-            where T : CustomResource
+    private ResourceChangeResult ProcessResourceChange<T>(ConcurrentDictionary<string, T> map, WatchEventType watchEventType, T resource)
+            where T : CustomResource, IKubernetesStaticMetadata
     {
+        var resourceKey = (T.ObjectKind, resource.Metadata.Name);
+
+        if (IsSuperseded(resourceKey.ObjectKind, resourceKey.Name, resource.Metadata.Uid))
+        {
+            // A delete for the old object still cleans up its cached state, unless the
+            // replacement has already been observed under the same name.
+            if (watchEventType != WatchEventType.Deleted ||
+                (_observedResources.TryGetValue(resourceKey, out var current) &&
+                 !string.Equals(current.Uid, resource.Metadata.Uid, StringComparison.Ordinal)))
+            {
+                return ResourceChangeResult.Ignored;
+            }
+        }
+
         switch (watchEventType)
         {
             case WatchEventType.Added:
-                map.TryAdd(resource.Metadata.Name, resource);
-                break;
-
             case WatchEventType.Modified:
+                // DCP watches are torn down and re-established every few minutes (see
+                // KubernetesService.WatchAsync, which wraps the watch in PeriodicRestartAsyncEnumerable).
+                // A watch is backed by a list-and-watch request, so each fresh watch re-delivers every
+                // object that currently exists, and those replays are indistinguishable from real
+                // updates. Without this check a resource that never changes again - a container stuck
+                // in FailedToStart, for example - keeps producing snapshot versions and keeps re-reading
+                // DCP's log store for as long as the AppHost runs.
+                // See https://github.com/microsoft/aspire/issues/18869.
+                //
+                // resourceVersion is the standard mechanism for detecting this: the server changes it
+                // whenever the stored object changes and leaves it alone otherwise, so a replay of an
+                // unchanged object carries the version we have already seen.
+                // https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions
+                //
+                // A delete can occur while the watch is disconnected, so the replacement Added event
+                // can arrive without a preceding Deleted event. Kubernetes UIDs identify object
+                // incarnations and let that replacement through even if its opaque resource version
+                // happens to equal the value recorded for the previous object.
+                // https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
+                var resourceUid = resource.Metadata.Uid;
+                var resourceVersion = resource.Metadata.ResourceVersion;
+                var hasPreviousObservation = _observedResources.TryGetValue(resourceKey, out var previousObservation);
+                var isSameResource = !hasPreviousObservation || HasSameResourceIdentity(previousObservation.Uid, resourceUid);
+
+                // The value is opaque, so it is only compared for equality; ordering is explicitly not defined. 
+                // An empty value means the server did not supply one, which is treated as "cannot tell", 
+                // so the event is processed rather than risk suppressing a real change.
+                if (isSameResource &&
+                    !string.IsNullOrEmpty(resourceVersion) &&
+                    string.Equals(previousObservation.ResourceVersion, resourceVersion, StringComparison.Ordinal))
+                {
+                    if (_logger.IsEnabled(LogLevel.Trace))
+                    {
+                        _logger.LogTrace("Ignoring {ResourceKind} resource {ResourceName} reported by the DCP watch because its resource version {ResourceVersion} is unchanged.", T.ObjectKind, resource.Metadata.Name, resourceVersion);
+                    }
+
+                    return ResourceChangeResult.Ignored;
+                }
+
+                var isReplacement = hasPreviousObservation &&
+                    !string.IsNullOrEmpty(previousObservation.Uid) &&
+                    !string.IsNullOrEmpty(resourceUid) &&
+                    !isSameResource;
+
+                // Added is treated like Modified rather than using TryAdd. A watch restart replays
+                // existing objects as Added, and if such an object changed while the watch was down,
+                // keeping the stale instance would leave the map disagreeing with both the version
+                // recorded here and the snapshot published to subscribers.
+                _observedResources[resourceKey] = new(resourceUid, resourceVersion);
                 map[resource.Metadata.Name] = resource;
-                break;
+                return isReplacement ? ResourceChangeResult.Replaced : ResourceChangeResult.Updated;
 
             case WatchEventType.Deleted:
+                // A delete can reach this watcher before StartResourceAsync receives NotFound
+                // from the API, leaving no observed UID for that path to mark later.
+                if (!string.IsNullOrEmpty(resource.Metadata.Uid))
+                {
+                    _supersededResourceUids[resourceKey] = resource.Metadata.Uid;
+                }
+                _observedResources.TryRemove(resourceKey, out _);
                 map.Remove(resource.Metadata.Name, out _);
-                break;
+                return ResourceChangeResult.Deleted;
 
             default:
-                return false;
+                return ResourceChangeResult.Ignored;
+        }
+    }
+
+    private bool IsSuperseded(string kind, string name, string? uid)
+    {
+        return _supersededResourceUids.TryGetValue((kind, name), out var supersededUid) &&
+            string.Equals(supersededUid, uid, StringComparison.Ordinal);
+    }
+
+    private static bool HasSameResourceIdentity(string? previousUid, string? resourceUid)
+    {
+        return string.Equals(previousUid, resourceUid, StringComparison.Ordinal) ||
+            (string.IsNullOrEmpty(previousUid) && string.IsNullOrEmpty(resourceUid));
+    }
+
+    private readonly record struct ObservedResource(string? Uid, string? ResourceVersion);
+
+    private enum ResourceChangeResult
+    {
+        Ignored,
+        Updated,
+        Replaced,
+        Deleted
+    }
+
+    private sealed class LogStreamState(string? resourceUid) : IDisposable
+    {
+        private readonly object _lock = new();
+        private readonly CancellationTokenSource _cancellation = new();
+        private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private bool _disposed;
+
+        public CancellationToken CancellationToken
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    ObjectDisposedException.ThrowIf(_disposed, this);
+                    return _cancellation.Token;
+                }
+            }
         }
 
-        return true;
+        public Task Task => _completion.Task;
+
+        public string? ResourceUid { get; } = resourceUid;
+
+        // Access is guarded by the owning DcpResourceWatcher's pending-deduplication lock.
+        public PendingFollowLogDeduplication? PendingDeduplication { get; set; }
+
+        public bool TryDeliver(Action deliver)
+        {
+            lock (_lock)
+            {
+                if (_disposed || _cancellation.IsCancellationRequested)
+                {
+                    return false;
+                }
+
+                // Cancellation takes this same lock, so reset cannot free the resource-name slot
+                // until a delivery that already started has finished publishing synchronously.
+                deliver();
+                return true;
+            }
+        }
+
+        public void Cancel()
+        {
+            lock (_lock)
+            {
+                if (!_disposed)
+                {
+                    _cancellation.Cancel();
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                lock (_lock)
+                {
+                    if (!_disposed)
+                    {
+                        _cancellation.Dispose();
+                        _disposed = true;
+                    }
+                }
+            }
+            finally
+            {
+                _completion.TrySetResult();
+            }
+        }
     }
 
     private sealed class PendingFollowLogDeduplication(
+        string? resourceUid,
         Dictionary<LogEntryKey, int> counts,
         DateTime? latestTimestamp,
         int remainingCount)
     {
+        public string? ResourceUid { get; } = resourceUid;
+
         public Dictionary<LogEntryKey, int> Counts { get; } = counts;
 
         public DateTime? LatestTimestamp { get; } = latestTimestamp;

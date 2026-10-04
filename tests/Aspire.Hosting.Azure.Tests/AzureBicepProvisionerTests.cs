@@ -15,8 +15,8 @@ using Aspire.Hosting.Utils;
 using Azure;
 using Azure.Core;
 using Azure.ResourceManager;
-using Azure.ResourceManager.Resources;
-using Azure.ResourceManager.Resources.Models;
+using Azure.ResourceManager.Resources.Deployments;
+using Azure.ResourceManager.Resources.Deployments.Models;
 using Azure.Security.KeyVault.Secrets;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.DependencyInjection;
@@ -24,7 +24,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Aspire.Hosting.Azure.Tests;
 
-public class AzureBicepProvisionerTests
+public class AzureBicepProvisionerTests(ITestOutputHelper testOutputHelper)
 {
     [Theory]
     [InlineData("1alpha")]
@@ -36,7 +36,7 @@ public class AzureBicepProvisionerTests
     {
         Assert.Throws<ArgumentException>(() =>
         {
-            using var builder = TestDistributedApplicationBuilder.Create();
+            using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
             builder.AddAzureInfrastructure("infrastructure", _ => { })
                    .WithParameter(bicepParameterName);
         });
@@ -51,7 +51,7 @@ public class AzureBicepProvisionerTests
     [InlineData("Alpha1_A")]
     public void WithParameterAllowsParameterNamesWhichAreValidBicepIdentifiers(string bicepParameterName)
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.AddAzureInfrastructure("infrastructure", _ => { })
                 .WithParameter(bicepParameterName);
     }
@@ -61,7 +61,7 @@ public class AzureBicepProvisionerTests
     {
         var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
 
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
 
         var cosmos = builder.AddAzureCosmosDB("cosmosdb");
         var db = cosmos.AddCosmosDatabase("db");
@@ -92,7 +92,7 @@ public class AzureBicepProvisionerTests
         // Test that BicepProvisioner can be instantiated with required dependencies
 
         // Arrange
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         var services = builder.Services.BuildServiceProvider();
 
@@ -118,7 +118,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_InPublishMode_ThrowsForUnknownPrincipalParameters()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -146,10 +146,136 @@ public class AzureBicepProvisionerTests
         Assert.Contains("Azure principal parameter was not supplied", exception.Message);
     }
 
+    [Theory]
+    [InlineData("User")]
+    [InlineData("ServicePrincipal")]
+    public async Task GetOrCreateResourceAsync_InPublishMode_PopulatesUserPrincipalParameters(string principalType)
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
+        builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
+        using var services = builder.Services.BuildServiceProvider();
+
+        var resource = new AzureBicepResource("sandbox-group", templateString: "output id string = 'ok'");
+        resource.Parameters[AzureBicepResource.KnownParameters.UserPrincipalId] = null;
+        resource.Parameters[AzureBicepResource.KnownParameters.PrincipalType] = null;
+
+        var sentinel = new InvalidOperationException("stop-after-populate-well-known-parameters");
+        var bicepExecutor = new ThrowingBicepCompiler(sentinel);
+        var provisioner = new BicepProvisioner(
+            services.GetRequiredService<ResourceNotificationService>(),
+            services.GetRequiredService<ResourceLoggerService>(),
+            bicepExecutor,
+            new TestSecretClientProvider(),
+            services.GetRequiredService<IDeploymentStateManager>(),
+            new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+            services.GetRequiredService<IFileSystemService>(),
+            NullLogger<BicepProvisioner>.Instance);
+
+        var principalId = Guid.Parse("11111111-2222-3333-4444-555555555555");
+        var context = ProvisioningTestHelpers.CreateTestProvisioningContext(
+            principal: new AzurePrincipal(principalId, "deployment-principal", principalType),
+            executionContext: new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish));
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provisioner.GetOrCreateResourceAsync(resource, context, CancellationToken.None));
+        Assert.Same(sentinel, thrown);
+
+        Assert.Equal(principalId, resource.Parameters[AzureBicepResource.KnownParameters.UserPrincipalId]);
+        Assert.Equal(principalType, resource.Parameters[AzureBicepResource.KnownParameters.PrincipalType]);
+    }
+
+    [Theory]
+    [InlineData(DistributedApplicationOperation.Run)]
+    [InlineData(DistributedApplicationOperation.Publish)]
+    public async Task GetOrCreateResourceAsync_ThrowsWhenExplicitUserPrincipalIdHasNoPrincipalType(DistributedApplicationOperation operation)
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(operation, testOutputHelper);
+        builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
+        using var services = builder.Services.BuildServiceProvider();
+
+        var resource = new AzureBicepResource("sandbox-group", templateString: "output id string = 'ok'");
+        resource.Parameters[AzureBicepResource.KnownParameters.UserPrincipalId] = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        resource.Parameters[AzureBicepResource.KnownParameters.PrincipalType] = null;
+
+        var provisioner = new BicepProvisioner(
+            services.GetRequiredService<ResourceNotificationService>(),
+            services.GetRequiredService<ResourceLoggerService>(),
+            new TestBicepCliExecutor(),
+            new TestSecretClientProvider(),
+            services.GetRequiredService<IDeploymentStateManager>(),
+            new DistributedApplicationExecutionContext(operation),
+            services.GetRequiredService<IFileSystemService>(),
+            NullLogger<BicepProvisioner>.Instance);
+
+        var context = ProvisioningTestHelpers.CreateTestProvisioningContext(
+            executionContext: new DistributedApplicationExecutionContext(operation));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provisioner.GetOrCreateResourceAsync(resource, context, CancellationToken.None));
+
+        Assert.Equal(
+            "The Azure parameter 'principalType' must be supplied when 'userPrincipalId' is provided explicitly.",
+            exception.Message);
+    }
+
+    [Theory]
+    [InlineData("User")]
+    [InlineData("ServicePrincipal")]
+    [InlineData("Group")]
+    public async Task GetOrCreateResourceAsync_InRunMode_PopulatesPrincipalTypeFromContext(string principalType)
+    {
+        // Regression test for https://github.com/microsoft/aspire/issues/13933.
+        // The PrincipalType value must come from the credential's detected principal type
+        // (carried on ProvisioningContext.Principal.Type) instead of a hardcoded "User",
+        // otherwise role-assignment Bicep deployments fail under service-principal /
+        // federated workload identity credentials with PrincipalNotFound / UnmatchedPrincipalType.
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
+        builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
+        using var services = builder.Services.BuildServiceProvider();
+
+        var resource = new AzureBicepResource("storage-roles", templateString: "output id string = 'ok'");
+        resource.Parameters[AzureBicepResource.KnownParameters.PrincipalId] = null;
+        resource.Parameters[AzureBicepResource.KnownParameters.PrincipalName] = null;
+        resource.Parameters[AzureBicepResource.KnownParameters.PrincipalType] = null;
+
+        // The compiler stub raises a sentinel so the flow stops right after
+        // PopulateWellKnownParameters mutates the resource. The downstream ARM deployment
+        // requires a live Azure connection, so short-circuiting here keeps the test hermetic.
+        var sentinel = new InvalidOperationException("stop-after-populate-well-known-parameters");
+        var bicepExecutor = new ThrowingBicepCompiler(sentinel);
+
+        var provisioner = new BicepProvisioner(
+            services.GetRequiredService<ResourceNotificationService>(),
+            services.GetRequiredService<ResourceLoggerService>(),
+            bicepExecutor,
+            new TestSecretClientProvider(),
+            services.GetRequiredService<IDeploymentStateManager>(),
+            new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run),
+            services.GetRequiredService<IFileSystemService>(),
+            NullLogger<BicepProvisioner>.Instance);
+
+        var context = ProvisioningTestHelpers.CreateTestProvisioningContext(
+            principal: new AzurePrincipal(Guid.Parse("11111111-2222-3333-4444-555555555555"), "ci-runner", principalType));
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provisioner.GetOrCreateResourceAsync(resource, context, CancellationToken.None));
+        Assert.Same(sentinel, thrown);
+
+        Assert.Equal(principalType, resource.Parameters[AzureBicepResource.KnownParameters.PrincipalType]);
+    }
+
+    private sealed class ThrowingBicepCompiler(Exception toThrow) : IBicepCompiler
+    {
+        public Task<string> CompileBicepToArmAsync(string bicepFilePath, CancellationToken cancellationToken = default)
+        {
+            throw toThrow;
+        }
+    }
+
     [Fact]
     public async Task GetOrCreateResourceAsync_WithSubscriptionScope_UsesSubscriptionDeploymentCollection()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -160,7 +286,7 @@ public class AzureBicepProvisionerTests
             targetScope = 'subscription'
             output result string = 'ok'
             """);
-        resource.Scope = AzureBicepResourceScope.ForSubscription(subscription.Id.Name);
+        resource.Scope = AzureBicepResourceScope.CreateForSubscription(subscription.Id.Name);
 
         var provisioner = CreateProvisioner(services);
         var context = ProvisioningTestHelpers.CreateTestProvisioningContext(
@@ -184,7 +310,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_WithTenantScope_UsesTenantDeploymentCollection()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -195,7 +321,7 @@ public class AzureBicepProvisionerTests
             targetScope = 'tenant'
             output result string = 'ok'
             """);
-        resource.Scope = AzureBicepResourceScope.ForTenant();
+        resource.Scope = AzureBicepResourceScope.CreateForTenant();
 
         var provisioner = CreateProvisioner(services);
         var context = ProvisioningTestHelpers.CreateTestProvisioningContext(
@@ -219,7 +345,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_WithResourceGroupAndSubscriptionScope_UsesScopedResourceGroupDeploymentCollection()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -252,7 +378,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_WithDefaultScope_UsesResourceGroupDeploymentCollection()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -282,7 +408,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_WithSubscriptionScopeInRunMode_UsesSubscriptionDeploymentCollection()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -293,7 +419,7 @@ public class AzureBicepProvisionerTests
             targetScope = 'subscription'
             output result string = 'ok'
             """);
-        resource.Scope = AzureBicepResourceScope.ForSubscription(subscription.Id.Name);
+        resource.Scope = AzureBicepResourceScope.CreateForSubscription(subscription.Id.Name);
 
         var provisioner = CreateProvisioner(services, DistributedApplicationOperation.Run);
         var context = ProvisioningTestHelpers.CreateTestProvisioningContext(
@@ -317,7 +443,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_InPublishMode_DoesNotQueryDeploymentOperationsAfterSuccessfulDeployment()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -363,7 +489,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_InPublishMode_EnrichesDeploymentStartFailures()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -407,7 +533,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_InPublishMode_UsesDeploymentOperationDetailsWhenWaitingFails()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -486,7 +612,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_InPublishMode_EnrichesDeploymentOperationFailuresInParallel()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish, testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(new MockDeploymentStateManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -599,7 +725,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_UsesEffectiveResourceLocationInSnapshot()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -633,7 +759,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_PublishesPredictedDeploymentIdBeforeDeploymentStarts()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -663,7 +789,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_PublishesSubscriptionScopedPredictedDeploymentIdAndUrlWhileWaiting()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -671,7 +797,7 @@ public class AzureBicepProvisionerTests
         var tenant = new TestTenantResource();
         var resource = new AzureBicepResource("subscriptionDeployment", templateString: "output name string = 'subscriptionDeployment'")
         {
-            Scope = AzureBicepResourceScope.ForSubscription(subscription.Id.Name)
+            Scope = AzureBicepResourceScope.CreateForSubscription(subscription.Id.Name)
         };
 
         var provisioner = new BicepProvisioner(
@@ -702,7 +828,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task ConfigureResourceAsync_DoesNotReuseOverrideOnlyDeploymentState()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -732,7 +858,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task ConfigureResourceAsync_DoesNotReuseInProgressDeploymentState()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -768,7 +894,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task ConfigureResourceAsync_PublishesAzureIdentityPropertiesFromDeploymentState()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -819,7 +945,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task ConfigureResourceAsync_PublishesResourceGroupFromCachedDeploymentId()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -865,7 +991,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_PreservesLocationOverrideInDeploymentState()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -899,7 +1025,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_ClearsStaleLocationOverrideWhenEffectiveLocationChanges()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -931,7 +1057,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_SavesInProgressDeploymentStateBeforeWaiting()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -964,7 +1090,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_PublishesFailedDeploymentOperationDetailsWhenWaitingFails()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -1123,7 +1249,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_ClearsStaleDeploymentOperationDetailsWhenDeploymentStartFails()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -1182,7 +1308,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_CancelsStartedDeploymentWhenWaitIsCanceled()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -1215,7 +1341,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_CancelsPendingDeploymentWhenStartIsCanceled()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -1248,7 +1374,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_PersistsCanceledStateWhenCancelFindsAlreadyInactiveDeployment()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -1281,7 +1407,7 @@ public class AzureBicepProvisionerTests
     public async Task GetOrCreateResourceAsync_AdoptsActiveCachedDeploymentWhenCreateReportsDeploymentActive()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1316,7 +1442,7 @@ public class AzureBicepProvisionerTests
     public async Task GetOrCreateResourceAsync_DoesNotAdoptActiveDeploymentWhenCachedChecksumDoesNotMatch()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1342,7 +1468,7 @@ public class AzureBicepProvisionerTests
     [Fact]
     public async Task GetOrCreateResourceAsync_SavesTerminalDeploymentStateWhenDeploymentFails()
     {
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(ProvisioningTestHelpers.CreateUserSecretsManager());
         using var services = builder.Services.BuildServiceProvider();
 
@@ -1446,7 +1572,7 @@ public class AzureBicepProvisionerTests
     public async Task ReconcileDeploymentStateAsync_ConfiguresSucceededDeploymentFromArm()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1478,7 +1604,7 @@ public class AzureBicepProvisionerTests
     public async Task ReconcileDeploymentStateAsync_WaitsForRunningDeploymentBeforeConfiguring()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1506,7 +1632,7 @@ public class AzureBicepProvisionerTests
     public async Task ReconcileDeploymentStateAsync_ClearsStaleRunningStateWhenDeploymentIsMissing()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1530,7 +1656,7 @@ public class AzureBicepProvisionerTests
     public async Task ReconcileDeploymentStateAsync_LeavesRunningStateWhenArmCannotBeQueried()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1557,7 +1683,7 @@ public class AzureBicepProvisionerTests
     public async Task ReconcileDeploymentStateAsync_LeavesRunningStateWhenArmFailsDuringWait()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1586,7 +1712,7 @@ public class AzureBicepProvisionerTests
     public async Task ReconcileDeploymentStateAsync_PersistsFailedStateAndThrowsWhenDeploymentFailed()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1611,7 +1737,7 @@ public class AzureBicepProvisionerTests
     public async Task ReconcileDeploymentStateAsync_PersistsCanceledStateAndThrowsWhenDeploymentCanceled()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1640,7 +1766,7 @@ public class AzureBicepProvisionerTests
     public async Task ReconcileDeploymentStateAsync_ReturnsFalseWhenSucceededDeploymentChecksumDoesNotMatch()
     {
         var deploymentStateManager = new InMemoryDeploymentStateManager();
-        using var builder = TestDistributedApplicationBuilder.Create();
+        using var builder = TestDistributedApplicationBuilder.Create(testOutputHelper);
         builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
         using var services = builder.Services.BuildServiceProvider();
         var resource = CreateReconciledStorageResource();
@@ -1714,7 +1840,7 @@ public class AzureBicepProvisionerTests
     private static async Task SeedRunningDeploymentStateAsync(IDeploymentStateManager deploymentStateManager, AzureBicepResource resource, string deploymentId)
     {
         var parameters = new JsonObject();
-        await BicepUtilities.SetParametersAsync(parameters, resource);
+        await BicepUtilities.SetParametersAsync(parameters, resource, new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run));
 
         var scope = new JsonObject();
         await BicepUtilities.SetScopeAsync(scope, resource);
@@ -1823,6 +1949,9 @@ public class AzureBicepProvisionerTests
         {
             return Task.FromResult(new DeploymentStateSection(sectionName, [], 0));
         }
+
+        public Task<DeploymentStateSection> AcquireCurrentSectionAsync(string sectionName, CancellationToken cancellationToken = default)
+            => AcquireSectionAsync(sectionName, cancellationToken);
 
         public Task DeleteSectionAsync(DeploymentStateSection section, CancellationToken cancellationToken = default)
         {

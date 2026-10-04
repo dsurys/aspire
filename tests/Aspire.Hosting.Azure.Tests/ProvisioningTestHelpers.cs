@@ -19,14 +19,15 @@ using Azure.Core;
 using Azure.ResourceManager;
 using Azure.ResourceManager.Authorization;
 using Azure.ResourceManager.Authorization.Models;
-using Azure.ResourceManager.Resources;
-using Azure.ResourceManager.Resources.Models;
+using Azure.ResourceManager.Resources.Deployments;
+using Azure.ResourceManager.Resources.Deployments.Models;
 using Azure.Security.KeyVault.Secrets;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using ResourceGroupData = Azure.ResourceManager.Resources.ResourceGroupData;
 
 namespace Aspire.Hosting.Azure.Tests;
 
@@ -45,7 +46,7 @@ internal static class ProvisioningTestHelpers
         IResourceGroupResource? resourceGroup = null,
         ITenantResource? tenant = null,
         AzureLocation? location = null,
-        UserPrincipal? principal = null,
+        AzurePrincipal? principal = null,
         DistributedApplicationExecutionContext? executionContext = null)
     {
         return new ProvisioningContext(
@@ -55,7 +56,7 @@ internal static class ProvisioningTestHelpers
             resourceGroup ?? new TestResourceGroupResource(),
             tenant ?? new TestTenantResource(),
             location ?? AzureLocation.WestUS2,
-            principal ?? new UserPrincipal(Guid.NewGuid(), "test@example.com"),
+            principal ?? new AzurePrincipal(Guid.NewGuid(), "test@example.com"),
             executionContext ?? new DistributedApplicationExecutionContext(DistributedApplicationOperation.Run));
     }
 
@@ -85,7 +86,7 @@ internal static class ProvisioningTestHelpers
     public static ISecretClientProvider CreateSecretClientProvider() => new TestSecretClientProvider(CreateTokenCredentialProvider());
     public static IBicepCompiler CreateBicepCompiler() => new TestBicepCompiler();
     public static IDeploymentStateManager CreateUserSecretsManager() => new TestUserSecretsManager();
-    public static IUserPrincipalProvider CreateUserPrincipalProvider() => new TestUserPrincipalProvider();
+    public static IAzurePrincipalProvider CreateAzurePrincipalProvider() => new TestAzurePrincipalProvider();
     public static TokenCredential CreateTokenCredential() => new TestTokenCredential();
 
     /// <summary>
@@ -1043,6 +1044,9 @@ internal sealed class TestUserSecretsManager : IDeploymentStateManager
         return Task.FromResult(new DeploymentStateSection(sectionName, sectionData, 0));
     }
 
+    public Task<DeploymentStateSection> AcquireCurrentSectionAsync(string sectionName, CancellationToken cancellationToken = default)
+        => AcquireSectionAsync(sectionName, cancellationToken);
+
     public Task DeleteSectionAsync(DeploymentStateSection section, CancellationToken cancellationToken = default)
     {
         return Task.CompletedTask;
@@ -1057,11 +1061,11 @@ internal sealed class TestUserSecretsManager : IDeploymentStateManager
     public Task ClearAllStateAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 }
 
-internal sealed class TestUserPrincipalProvider : IUserPrincipalProvider
+internal sealed class TestAzurePrincipalProvider : IAzurePrincipalProvider
 {
-    public Task<UserPrincipal> GetUserPrincipalAsync(CancellationToken cancellationToken = default)
+    public Task<AzurePrincipal> GetPrincipalAsync(CancellationToken cancellationToken = default)
     {
-        var principal = new UserPrincipal(Guid.Parse("11111111-2222-3333-4444-555555555555"), "test@example.com");
+        var principal = new AzurePrincipal(Guid.Parse("11111111-2222-3333-4444-555555555555"), "test@example.com");
         return Task.FromResult(principal);
     }
 }

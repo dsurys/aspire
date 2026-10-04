@@ -1,14 +1,20 @@
 import * as vscode from 'vscode';
 import * as childProcess from 'child_process';
-import { aspireTerminalName, dcpServerNotInitialized, rpcServerNotInitialized, terminalCommandArgumentControlCharacters, terminalCommandUnsafeLiteral } from '../loc/strings';
+import { aspireTerminalClosedBeforeProcessStarted, aspireTerminalName, aspireTerminalProcessFailedToStart, dcpServerNotInitialized, rpcServerNotInitialized, terminalCommandUnsafeLiteral } from '../loc/strings';
 import { extensionLogOutputChannel } from './logging';
 import { RpcServerConnectionInfo } from '../server/AspireRpcServer';
 import { DcpServerConnectionInfo } from '../dcp/types';
 import { getRunSessionInfo, getSupportedCapabilities } from '../capabilities';
-import { EnvironmentVariables, getEnvironmentWithoutE2EBridgeVariables } from './environment';
-import { resolveCliPath } from './cliPath';
-import { ASPIRE_CLI_PATH_ENV_VAR, getForwardableAspireCliPath } from './cliPathEnvironment';
+import { EnvironmentVariables, getEnvironmentForChildProcess } from './environment';
+import { CliPathResolutionResult, CliPathResolver, resolveCliPath } from './cliPath';
+import { ASPIRE_CLI_PATH_ENV_VAR, getForwardableAspireCliPath, getForwardableResolvedAspireCliPath } from './cliPathEnvironment';
+import { CliPathResolutionTarget, getCliPathTargetKey, windowCliPathTarget } from './cliPathVariables';
 import path from 'path';
+import { assertNoTerminalControlCharacters } from './cmdShim';
+import { reportCliResolvedForOperation } from './cliOperationResolution';
+
+// Re-exported so existing importers keep a single implementation of the guard.
+export { assertNoTerminalControlCharacters };
 
 export const enum AnsiColors {
     Green = '\x1b[32m',
@@ -19,11 +25,14 @@ export const enum AnsiColors {
 export interface AspireTerminal {
     terminal: vscode.Terminal;
     dispose: () => void;
+    resolvedCliPath?: string;
 }
 
 export interface SendAspireCommandOptions {
     redactAdditionalArgs?: boolean;
     terminalTarget?: 'shared' | 'editor';
+    target: CliPathResolutionTarget;
+    cliPath?: string;
 }
 
 // String parts are fixed CLI syntax and are validated before interpolation.
@@ -108,7 +117,9 @@ export function shellArg(value: string): ShellArg {
 }
 
 export class AspireTerminalProvider implements vscode.Disposable {
-    private _terminalByDebugSessionId: Map<string | null, AspireTerminal> = new Map();
+    private _terminalByDebugSessionId = new Map<string, AspireTerminal>();
+    private _invalidatedSharedTerminals = new Set<vscode.Terminal>();
+    private readonly _terminalsWithAspireCommands = new WeakSet<vscode.Terminal>();
     private _rpcServerConnectionInfo?: RpcServerConnectionInfo;
     private _dcpServerConnectionInfo?: DcpServerConnectionInfo;
     private _windowsPowerShellPath?: string;
@@ -119,8 +130,10 @@ export class AspireTerminalProvider implements vscode.Disposable {
     constructor(
         subscriptions: vscode.Disposable[],
         private readonly _isPowerShell7Available = isPowerShell7Available,
+        private readonly _cliPathResolver?: CliPathResolver,
     ) {
         subscriptions.push(vscode.window.onDidCloseTerminal(closedTerminal => {
+            this._invalidatedSharedTerminals.delete(closedTerminal);
             for (const [debugSessionId, terminal] of this._terminalByDebugSessionId.entries()) {
                 if (terminal.terminal === closedTerminal) {
                     this._terminalByDebugSessionId.delete(debugSessionId);
@@ -155,7 +168,12 @@ export class AspireTerminalProvider implements vscode.Disposable {
     }
 
     async sendAspireCommandToAspireTerminal(subcommand: AspireSubcommand, showTerminal: boolean = true, additionalArgs?: string[], options?: SendAspireCommandOptions) {
-        const cliPath = await this.getAspireCliExecutablePath();
+        const target = options?.target ?? windowCliPathTarget;
+        const resolvedForThisCommand = options?.cliPath === undefined;
+        const cliPath = options?.cliPath ?? await this.getAspireCliExecutablePath(target);
+        if (resolvedForThisCommand) {
+            reportCliResolvedForOperation(target, cliPath);
+        }
         const subcommandLine = formatSubcommand(subcommand);
         assertNoTerminalControlCharacters(cliPath);
 
@@ -205,8 +223,8 @@ export class AspireTerminalProvider implements vscode.Disposable {
         }
         else {
             aspireTerminal = terminalTarget === 'editor'
-                ? this.createAspireEditorTerminal()
-                : this.getAspireTerminal();
+                ? this.createAspireEditorTerminal(target, cliPath)
+                : this.getAspireTerminal(false, target, cliPath);
             executionMode = aspireTerminal.terminal.shellIntegration ? 'shellIntegration' : 'sendText';
         }
         this._onDidSendAspireCommand.fire({
@@ -234,18 +252,37 @@ export class AspireTerminalProvider implements vscode.Disposable {
 
         if (executionMode === 'shellIntegration' && aspireTerminal.terminal.shellIntegration) {
             aspireTerminal.terminal.shellIntegration.executeCommand(command);
+            this._terminalsWithAspireCommands.add(aspireTerminal.terminal);
         }
         else {
-            // Without shell integration, VS Code can't tell whether the terminal is idle or
-            // a foreground process is running, so keep the previous safe interruption behavior.
-            aspireTerminal.terminal.sendText('\x03', false);
+            // createTerminal can return before the shell process accepts input. Waiting for processId
+            // prevents the first fallback command from being dropped. Observe terminal closure too,
+            // because processId can remain pending when the shell process fails to start.
+            await this.waitForTerminalProcess(aspireTerminal.terminal);
+
+            const hasReceivedAspireCommand = this._terminalsWithAspireCommands.has(aspireTerminal.terminal);
+            if (hasReceivedAspireCommand) {
+                // Without shell integration, VS Code can't tell whether the terminal is idle or
+                // a foreground process is running, so interrupt commands previously sent by Aspire.
+                aspireTerminal.terminal.sendText('\x03', false);
+            }
             aspireTerminal.terminal.sendText(command);
+            this._terminalsWithAspireCommands.add(aspireTerminal.terminal);
         }
 
     }
 
-    getAspireTerminal(forceCreate?: boolean): AspireTerminal {
-        const existingTerminal = this._terminalByDebugSessionId.get(null);
+    getAspireTerminal(
+        forceCreate: boolean = false,
+        target: CliPathResolutionTarget = windowCliPathTarget,
+        resolvedCliPath?: string,
+    ): AspireTerminal {
+        const terminalKey = this.getTerminalKey(undefined, target);
+        let existingTerminal = this._terminalByDebugSessionId.get(terminalKey);
+        if (existingTerminal && resolvedCliPath !== undefined && !areResolvedCliPathsEqual(existingTerminal.resolvedCliPath, resolvedCliPath)) {
+            this.invalidateSharedAspireTerminal(target);
+            existingTerminal = undefined;
+        }
         if (existingTerminal) {
             if (!forceCreate) {
                 return existingTerminal;
@@ -256,36 +293,87 @@ export class AspireTerminalProvider implements vscode.Disposable {
         }
 
         extensionLogOutputChannel.info(`Creating new Aspire terminal`);
-        const terminal = this.createTerminal();
+        const terminal = this.createTerminal(undefined, target, resolvedCliPath);
 
         const aspireTerminal: AspireTerminal = {
             terminal,
+            resolvedCliPath,
             dispose: () => {
                 terminal.dispose();
-                this._terminalByDebugSessionId.delete(null);
+                this._terminalByDebugSessionId.delete(terminalKey);
             }
         };
 
-        this._terminalByDebugSessionId.set(null, aspireTerminal);
+        this._terminalByDebugSessionId.set(terminalKey, aspireTerminal);
 
         return aspireTerminal;
     }
 
-    private createAspireEditorTerminal(): AspireTerminal {
+    private async waitForTerminalProcess(terminal: vscode.Terminal): Promise<void> {
+        let closeListener: vscode.Disposable | undefined;
+        try {
+            const processId = await Promise.race([
+                terminal.processId,
+                new Promise<never>((_, reject) => {
+                    closeListener = vscode.window.onDidCloseTerminal(closedTerminal => {
+                        if (closedTerminal === terminal) {
+                            reject(new Error(aspireTerminalClosedBeforeProcessStarted));
+                        }
+                    });
+                }),
+            ]);
+
+            if (processId === undefined) {
+                throw new Error(aspireTerminalProcessFailedToStart);
+            }
+        }
+        finally {
+            closeListener?.dispose();
+        }
+    }
+
+    invalidateSharedAspireTerminal(target?: CliPathResolutionTarget): void {
+        const terminalKeys = target
+            ? [this.getTerminalKey(undefined, target)]
+            : [...this._terminalByDebugSessionId.keys()].filter(key => key.startsWith('shared:'));
+
+        for (const terminalKey of terminalKeys) {
+            const existingTerminal = this._terminalByDebugSessionId.get(terminalKey);
+            if (!existingTerminal) {
+                continue;
+            }
+
+            // The terminal may be running a long-lived command, so leave it open. Stop reusing it
+            // so the next Aspire command gets a new terminal with the current environment.
+            extensionLogOutputChannel.info('Invalidating shared Aspire terminal environment');
+            this._terminalByDebugSessionId.delete(terminalKey);
+            this._invalidatedSharedTerminals.add(existingTerminal.terminal);
+        }
+    }
+
+    private createAspireEditorTerminal(target: CliPathResolutionTarget, resolvedCliPath: string): AspireTerminal {
         extensionLogOutputChannel.info('Creating Aspire editor terminal');
-        const terminal = this.createTerminal(vscode.TerminalLocation.Editor);
+        const terminal = this.createTerminal(vscode.TerminalLocation.Editor, target, resolvedCliPath);
         return {
             terminal,
+            resolvedCliPath,
             dispose: () => terminal.dispose(),
         };
     }
 
-    private createTerminal(location?: vscode.TerminalLocation): vscode.Terminal {
+    private createTerminal(
+        location?: vscode.TerminalLocation,
+        target: CliPathResolutionTarget = windowCliPathTarget,
+        resolvedCliPath?: string,
+    ): vscode.Terminal {
         const terminalOptions: vscode.TerminalOptions = {
             name: aspireTerminalName,
-            env: this.createEnvironment(),
+            env: this.createEnvironment(undefined, undefined, undefined, resolvedCliPath),
             location,
         };
+        if (target.kind === 'workspaceFolder') {
+            terminalOptions.cwd = target.workspaceFolder.uri;
+        }
         if (process.platform === 'win32') {
             // quoteShellArg uses PowerShell escaping on Windows. Do not rely on the
             // user's default terminal profile because cmd.exe treats backticks as
@@ -296,10 +384,14 @@ export class AspireTerminalProvider implements vscode.Disposable {
         return vscode.window.createTerminal(terminalOptions);
     }
 
-    createEnvironment(debugSessionId?: string, noDebug?: boolean, noExtensionVariables?: boolean): any {
+    private getTerminalKey(debugSessionId: string | undefined, target: CliPathResolutionTarget): string {
+        return `${debugSessionId ?? 'shared'}:${getCliPathTargetKey(target)}`;
+    }
+
+    createEnvironment(debugSessionId?: string, noDebug?: boolean, noExtensionVariables?: boolean, resolvedCliPath?: string): any {
         if (noExtensionVariables) {
             const env: any = {
-                ...getEnvironmentWithoutE2EBridgeVariables(),
+                ...getEnvironmentForChildProcess(),
 
                 // Hidden CLI processes still render status/error text that VS Code shows to the user.
                 // Keep those messages aligned with the VS Code UI language without enabling the
@@ -307,17 +399,17 @@ export class AspireTerminalProvider implements vscode.Disposable {
                 ASPIRE_LOCALE_OVERRIDE: vscode.env.language,
             };
 
-            addForwardableAspireCliPath(env);
+            addForwardableAspireCliPath(env, resolvedCliPath);
             scrubNoExtensionVariablesEnvironment(env);
 
             return env;
         }
 
         const env: any = {
-            ...getEnvironmentWithoutE2EBridgeVariables(),
+            ...getEnvironmentForChildProcess(),
         };
 
-        addForwardableAspireCliPath(env);
+        addForwardableAspireCliPath(env, resolvedCliPath);
 
         Object.assign(env, {
             // Extension connection information
@@ -344,7 +436,7 @@ export class AspireTerminalProvider implements vscode.Disposable {
 
     createDcpRunSessionEnvironment(debugSessionId: string, noDebug?: boolean): any {
         const env: any = {
-            ...getEnvironmentWithoutE2EBridgeVariables(),
+            ...getEnvironmentForChildProcess(),
 
             // Include DCP server info without the extension RPC backchannel. Short-lived
             // helper CLI processes must not register an extension backchannel because the
@@ -421,18 +513,29 @@ export class AspireTerminalProvider implements vscode.Disposable {
         }
 
         this._terminalByDebugSessionId.clear();
+        this._invalidatedSharedTerminals.clear();
     }
 
     dispose() {
         for (const terminal of this._terminalByDebugSessionId.values()) {
             terminal.dispose();
         }
+        for (const terminal of this._invalidatedSharedTerminals) {
+            terminal.dispose();
+        }
+        this._invalidatedSharedTerminals.clear();
         this._onDidSendAspireCommand.dispose();
     }
 
 
-    async getAspireCliExecutablePath(): Promise<string> {
-        const result = await resolveCliPath();
+    async resolveAspireCliPath(target: CliPathResolutionTarget = windowCliPathTarget): Promise<CliPathResolutionResult> {
+        return this._cliPathResolver
+            ? await this._cliPathResolver.resolve(target)
+            : await resolveCliPath(target);
+    }
+
+    async getAspireCliExecutablePath(target: CliPathResolutionTarget = windowCliPathTarget): Promise<string> {
+        const result = await this.resolveAspireCliPath(target);
         return result.cliPath;
     }
 
@@ -457,6 +560,16 @@ export class AspireTerminalProvider implements vscode.Disposable {
     }
 }
 
+function areResolvedCliPathsEqual(left: string | undefined, right: string): boolean {
+    if (left === undefined) {
+        return false;
+    }
+
+    return process.platform === 'win32'
+        ? path.win32.normalize(left).toLowerCase() === path.win32.normalize(right).toLowerCase()
+        : left === right;
+}
+
 function isPowerShell7Available(): boolean {
     const result = childProcess.spawnSync('pwsh.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.Major'], {
         stdio: 'ignore',
@@ -466,7 +579,7 @@ function isPowerShell7Available(): boolean {
     return result.status === 0 && result.error === undefined;
 }
 
-function addForwardableAspireCliPath(env: Record<string, string | undefined>): void {
+function addForwardableAspireCliPath(env: Record<string, string | undefined>, resolvedCliPath?: string): void {
     // Forward aspire.aspireCliExecutablePath as AspireCliPath so MSBuild's
     // ResolveAspireCliBundle task — which `dotnet build` evaluates whenever
     // the AppHost is built (including from this CLI process and from VS
@@ -478,6 +591,20 @@ function addForwardableAspireCliPath(env: Record<string, string | undefined>): v
     // Only forward values that pass the task's File.Exists guard; stale
     // absolute paths make the task produce no bundle outputs instead of
     // falling back, and the AppHost targets can then fail with ASPIRE009.
+    if (resolvedCliPath !== undefined) {
+        // A concrete resolved path (e.g. from spawnCliProcess) is the exact executable this
+        // process launches, so it is the only candidate considered; delete any inherited
+        // AspireCliPath first so an unforwardable resolvedCliPath can't fall back to stale
+        // ambient metadata from a different CLI.
+        deleteEnvironmentVariable(env, ASPIRE_CLI_PATH_ENV_VAR);
+        const forwardableResolvedPath = getForwardableResolvedAspireCliPath(resolvedCliPath);
+        if (forwardableResolvedPath) {
+            env[ASPIRE_CLI_PATH_ENV_VAR] = forwardableResolvedPath;
+        }
+
+        return;
+    }
+
     const configuredCliPath = getForwardableAspireCliPath();
     if (configuredCliPath) {
         env[ASPIRE_CLI_PATH_ENV_VAR] = configuredCliPath;
@@ -512,8 +639,12 @@ function scrubNoExtensionVariablesEnvironment(env: Record<string, string | undef
 
 function deleteEnvironmentVariable(env: Record<string, string | undefined>, name: string): void {
     if (process.platform === 'win32') {
+        // Windows environment variable names are case-insensitive; compare uppercased so callers
+        // can pass a mixed-case canonical name (e.g. `AspireCliPath`) as well as already-uppercase
+        // constants.
+        const upperName = name.toUpperCase();
         for (const key of Object.keys(env)) {
-            if (key.toUpperCase() === name) {
+            if (key.toUpperCase() === upperName) {
                 delete env[key];
             }
         }
@@ -537,16 +668,6 @@ function isE2eTerminalCommandExecutionSuppressed(): boolean {
         process.env.ASPIRE_EXTENSION_E2E_SUPPRESS_TERMINAL_COMMAND_EXECUTION === 'true';
 }
 
-export function assertNoTerminalControlCharacters(value: string): void {
-    // Shell quoting protects shell metacharacters after the command reaches the
-    // shell. C0 controls are terminal input first: in sendText fallback, ETX can
-    // abort the current line and CR/LF can submit following text as another
-    // command before shell parsing can make those bytes inert. Tab is allowed
-    // because shells treat it as ordinary whitespace inside quotes.
-    if (/[\x00-\x08\x0A-\x1F\x7F]/.test(value)) {
-        throw new Error(terminalCommandArgumentControlCharacters);
-    }
-}
 
 function validateLiteralSubcommandPart(value: string): string {
     if (!/^-{0,2}[A-Za-z0-9][-A-Za-z0-9]*$/.test(value)) {

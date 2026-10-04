@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Xml.Linq;
 using Aspire.Cli.Configuration;
+using Aspire.Cli.Documentation;
 using Aspire.Cli.DotNet;
 using Aspire.Cli.Packaging;
 using Aspire.Cli.Processes;
@@ -25,6 +26,12 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
 {
     private const string ProjectHashFileName = ".projecthash";
     private const string AppsFolder = "hosts";
+
+    /// <summary>
+    /// Bump when the scaffold's shape changes in a way that requires a rewrite even though the
+    /// generated content for a given input would hash the same as a previously-cached scaffold.
+    /// </summary>
+    private const int ScaffoldSchemaVersion = 1;
     public const string ProjectFileName = "AppHostServer.csproj";
     private const string ProjectDllName = "AppHostServer.dll";
     internal const string TargetFramework = "net10.0";
@@ -42,6 +49,7 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
     private readonly IEnvironment _environment;
     private readonly ILogger _logger;
     private readonly string? _logFilePath;
+    private readonly string? _restoreRootConfigDirectory;
 
     public DotNetBasedAppHostServerProject(
         string appPath,
@@ -53,7 +61,8 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
         IEnvironment environment,
         ILogger<DotNetBasedAppHostServerProject> logger,
         string? projectModelPath = null,
-        string? logFilePath = null)
+        string? logFilePath = null,
+        string? restoreRootConfigDirectory = null)
     {
         _appPath = Path.GetFullPath(appPath);
         _appPath = new Uri(_appPath).LocalPath;
@@ -66,6 +75,7 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
         _environment = environment;
         _logger = logger;
         _logFilePath = logFilePath;
+        _restoreRootConfigDirectory = restoreRootConfigDirectory is not null ? Path.GetFullPath(restoreRootConfigDirectory) : null;
 
         var pathHash = SHA256.HashData(Encoding.UTF8.GetBytes(_appPath));
 
@@ -99,7 +109,7 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
     /// </summary>
     public string GetProjectFilePath() => Path.Combine(_projectModelPath, ProjectFileName);
 
-    public string GetProjectHash()
+    private string GetProjectHash()
     {
         var hashFilePath = Path.Combine(_projectModelPath, ProjectHashFileName);
 
@@ -111,7 +121,7 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
         return string.Empty;
     }
 
-    public void SaveProjectHash(string hash)
+    private void SaveProjectHash(string hash)
     {
         var hashFilePath = Path.Combine(_projectModelPath, ProjectHashFileName);
         File.WriteAllText(hashFilePath, hash);
@@ -120,108 +130,56 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
     /// <summary>
     /// Creates the project .csproj content using project references to the local Aspire repository.
     /// </summary>
-    private XDocument CreateProjectFile(IEnumerable<IntegrationReference> integrations)
+    private CSharpProjectFile CreateProjectFile(IEnumerable<IntegrationReference> integrations)
     {
         // Determine OS/architecture for DCP package name
-        var (buildOs, buildArch) = GetBuildPlatform();
+        var (buildOs, buildArch) = GetBuildPlatform(_environment);
         var dcpPackageName = $"microsoft.developercontrolplane.{buildOs}-{buildArch}";
         var dcpVersion = GetDcpVersionFromRepo(_repoRoot, buildOs, buildArch);
 
-        var template = $"""
-            <Project Sdk="Microsoft.NET.Sdk">
-                <PropertyGroup>
-                    <OutputType>exe</OutputType>
-                    <TargetFramework>{TargetFramework}</TargetFramework>
-                    <AssemblyName>{AssemblyName}</AssemblyName>
-                    <OutDir>{BuildFolder}</OutDir>
-                    <UserSecretsId>{_userSecretsId}</UserSecretsId>
-                    <IsAspireHost>true</IsAspireHost>
-                    <IsPublishable>false</IsPublishable>
-                    <SelfContained>false</SelfContained>
-                    <ImplicitUsings>enable</ImplicitUsings>
-                    <Nullable>enable</Nullable>
-                    <WarningLevel>0</WarningLevel>
-                    <EnableNETAnalyzers>false</EnableNETAnalyzers>
-                    <EnableRoslynAnalyzers>false</EnableRoslynAnalyzers>
-                    <RunAnalyzers>false</RunAnalyzers>
-                    <NoWarn>$(NoWarn);1701;1702;1591;CS8019;CS1591;CS1573;CS0168;CS0219;CS8618;CS8625;CS1998;CS1999</NoWarn>
-                    <!-- Properties for in-repo building -->
-                    <RepoRoot>{_repoRoot}</RepoRoot>
-                    <SkipValidateAspireHostProjectResources>true</SkipValidateAspireHostProjectResources>
-                    <SkipAddAspireDefaultReferences>true</SkipAddAspireDefaultReferences>
-                    <SkipAspireIntegrationAnalyzersReference>true</SkipAspireIntegrationAnalyzersReference>
-                    <AspireHostingSDKVersion>42.42.42</AspireHostingSDKVersion>
-                    <!-- DCP and Dashboard paths for local development -->
-                    <DcpDir>$([MSBuild]::EnsureTrailingSlash('$(NuGetPackageRoot)')){dcpPackageName}/{dcpVersion}/tools/</DcpDir>
-                    <AspireDashboardDir>{_repoRoot}artifacts/bin/Aspire.Dashboard/Debug/net8.0/</AspireDashboardDir>
-                </PropertyGroup>
-                <ItemGroup>
-                    <PackageReference Include="StreamJsonRpc" />
-                    <PackageReference Include="Google.Protobuf" />
-                </ItemGroup>
-            </Project>
-            """;
-
-        var doc = XDocument.Parse(template);
+        var projectFile = new CSharpProjectFile();
+        projectFile.AddProperty("OutputType", "exe");
+        projectFile.AddProperty("TargetFramework", TargetFramework);
+        projectFile.AddProperty("AssemblyName", AssemblyName);
+        projectFile.AddProperty("OutDir", BuildFolder);
+        projectFile.AddProperty("UserSecretsId", _userSecretsId);
+        projectFile.AddProperty("IsAspireHost", "true");
+        projectFile.AddProperty("IsPublishable", "false");
+        projectFile.AddProperty("SelfContained", "false");
+        projectFile.AddProperty("ImplicitUsings", "enable");
+        projectFile.AddProperty("Nullable", "enable");
+        projectFile.AddProperty("WarningLevel", "0");
+        projectFile.AddProperty("EnableNETAnalyzers", "false");
+        projectFile.AddProperty("EnableRoslynAnalyzers", "false");
+        projectFile.AddProperty("RunAnalyzers", "false");
+        projectFile.AddProperty("NoWarn", "$(NoWarn);1701;1702;1591;CS8019;CS1591;CS1573;CS0168;CS0219;CS8618;CS8625;CS1998;CS1999");
+        projectFile.AddProperty("RepoRoot", _repoRoot);
+        projectFile.AddProperty("SkipValidateAspireHostProjectResources", "true");
+        projectFile.AddProperty("SkipAddAspireDefaultReferences", "true");
+        projectFile.AddProperty("SkipAspireIntegrationAnalyzersReference", "true");
+        projectFile.AddProperty("AspireHostingSDKVersion", "42.42.42");
+        projectFile.AddProperty("DcpDir", $"$([MSBuild]::EnsureTrailingSlash('$(NuGetPackageRoot)')){dcpPackageName}/{dcpVersion}/tools/");
+        projectFile.AddProperty("AspireDashboardDir", $"{_repoRoot}artifacts/bin/Aspire.Dashboard/Debug/net11.0/");
+        projectFile.PackageReferences.Add(new CSharpPackageReference("StreamJsonRpc"));
+        projectFile.PackageReferences.Add(new CSharpPackageReference("Google.Protobuf"));
 
         // Add project references for Aspire.Hosting.* packages, NuGet for others
-        var projectRefGroup = new XElement("ItemGroup");
-        var addedProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var otherPackages = new List<(string Name, string Version)>();
+        var addedProjects = new HashSet<string>(StringComparers.FileSystemPath);
+        projectFile.AddIntegrationReferences(
+            integrations,
+            _repoRoot,
+            isAspireProjectResource: false,
+            addedProjectPaths: addedProjects,
+            packageVersionAttributeName: CSharpPackageReference.VersionOverrideAttributeName);
 
-        foreach (var integration in integrations)
-        {
-            if (integration.IsProjectReference)
-            {
-                // Explicit project reference from settings.json
-                if (addedProjects.Add(integration.Name))
-                {
-                    projectRefGroup.Add(new XElement("ProjectReference",
-                        new XAttribute("Include", integration.ProjectPath!),
-                        new XElement("IsAspireProjectResource", "false")));
-                }
-            }
-            else if (integration.Name.StartsWith("Aspire.Hosting", StringComparison.OrdinalIgnoreCase))
-            {
-                var projectPath = Path.Combine(_repoRoot, "src", integration.Name, $"{integration.Name}.csproj");
-                if (File.Exists(projectPath) && addedProjects.Add(integration.Name))
-                {
-                    projectRefGroup.Add(new XElement("ProjectReference",
-                        new XAttribute("Include", projectPath),
-                        new XElement("IsAspireProjectResource", "false")));
-                }
-            }
-            else
-            {
-                if (integration.Version is null)
-                {
-                    throw new InvalidOperationException($"Integration '{integration.Name}' is neither a project reference nor a package reference (both Version and ProjectPath are null).");
-                }
-                otherPackages.Add((integration.Name, integration.Version));
-            }
-        }
-
-        // Always add Aspire.Hosting project reference
-        var hostingPath = Path.Combine(_repoRoot, "src", "Aspire.Hosting", "Aspire.Hosting.csproj");
-        if (File.Exists(hostingPath) && addedProjects.Add("Aspire.Hosting"))
-        {
-            projectRefGroup.Add(new XElement("ProjectReference",
-                new XAttribute("Include", hostingPath),
-                new XElement("IsAspireProjectResource", "false")));
-        }
-
-        if (projectRefGroup.HasElements)
-        {
-            doc.Root!.Add(projectRefGroup);
-        }
-
-        if (otherPackages.Count > 0)
-        {
-            doc.Root!.Add(new XElement("ItemGroup",
-                otherPackages.Select(p => new XElement("PackageReference",
-                    new XAttribute("Include", p.Name),
-                    new XAttribute("Version", p.Version)))));
-        }
+        // Aspire configuration synthesizes the base Aspire.Hosting reference and ignores configured
+        // replacements. Add it defensively for direct callers that omit the base; path de-duplication
+        // handles the normal synthesized reference.
+        projectFile.AddRepositoryProjectReferenceIfExists(
+            _repoRoot,
+            "Aspire.Hosting",
+            isAspireProjectResource: false,
+            addedProjectPaths: addedProjects);
 
         // Add imports for in-repo AppHost building
         var appHostInTargets = Path.Combine(_repoRoot, "src", "Aspire.Hosting.AppHost", "build", "Aspire.Hosting.AppHost.in.targets");
@@ -229,33 +187,24 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
 
         if (File.Exists(appHostInTargets))
         {
-            doc.Root!.Add(new XElement("Import", new XAttribute("Project", appHostInTargets)));
+            projectFile.Imports.Add(new CSharpProjectImport(appHostInTargets));
         }
         if (File.Exists(sdkInTargets))
         {
-            doc.Root!.Add(new XElement("Import", new XAttribute("Project", sdkInTargets)));
+            projectFile.Imports.Add(new CSharpProjectImport(sdkInTargets));
         }
 
-        // Add Dashboard and RemoteHost project references
-        var dashboardProject = Path.Combine(_repoRoot, "src", "Aspire.Dashboard", "Aspire.Dashboard.csproj");
-        if (File.Exists(dashboardProject))
-        {
-            doc.Root!.Add(new XElement("ItemGroup",
-                new XElement("ProjectReference", new XAttribute("Include", dashboardProject))));
-        }
-
-        var remoteHostProject = Path.Combine(_repoRoot, "src", "Aspire.Hosting.RemoteHost", "Aspire.Hosting.RemoteHost.csproj");
-        if (File.Exists(remoteHostProject))
-        {
-            doc.Root!.Add(new XElement("ItemGroup",
-                new XElement("ProjectReference", new XAttribute("Include", remoteHostProject))));
-        }
+        // The Dashboard is a standalone net11 process and isn't loaded by the net10 AppHost scanner.
+        projectFile.AddRepositoryProjectReferenceIfExists(
+            _repoRoot,
+            "Aspire.Hosting.RemoteHost",
+            isAspireProjectResource: false);
 
         // Disable Aspire SDK code generation
-        doc.Root!.Add(new XElement("Target", new XAttribute("Name", "_CSharpWriteHostProjectMetadataSources")));
-        doc.Root!.Add(new XElement("Target", new XAttribute("Name", "_CSharpWriteProjectMetadataSources")));
+        projectFile.Targets.Add(new XElement("Target", new XAttribute("Name", "_CSharpWriteHostProjectMetadataSources")));
+        projectFile.Targets.Add(new XElement("Target", new XAttribute("Name", "_CSharpWriteProjectMetadataSources")));
 
-        return doc;
+        return projectFile;
     }
 
     /// <summary>
@@ -267,20 +216,6 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
         string? packageSourceOverride = null,
         CancellationToken cancellationToken = default)
     {
-        // Clean obj folder to ensure fresh NuGet restore
-        var objPath = Path.Combine(_projectModelPath, "obj");
-        if (Directory.Exists(objPath))
-        {
-            try
-            {
-                Directory.Delete(objPath, recursive: true);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to delete obj folder at {ObjPath}", objPath);
-            }
-        }
-
         // Create Program.cs
         var programCs = """
             await Aspire.Hosting.RemoteHost.RemoteHostServer.RunAsync(args);
@@ -319,26 +254,23 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
               ]
             }
             """;
-        File.WriteAllText(Path.Combine(_projectModelPath, "appsettings.json"), appSettingsJson);
 
         // Handle NuGet config and channel resolution
         string? channelName = null;
 
-        var userNugetConfig = FindNuGetConfig(_appPath);
-        if (userNugetConfig is not null)
-        {
-            var nugetConfigPath = Path.Combine(_projectModelPath, "nuget.config");
-            File.Copy(userNugetConfig, nugetConfigPath, overwrite: true);
-        }
+        var userNugetConfig = _restoreRootConfigDirectory is null ? await FindNuGetConfigAsync(_appPath, cancellationToken) : null;
+        var nugetConfigContent = userNugetConfig is not null
+            ? File.ReadAllText(userNugetConfig)
+            : null;
 
         var configuredChannelName = requestedChannel
             ?? AspireConfigFile.Load(_appPath)?.Channel
             ?? AspireJsonConfiguration.Load(_appPath)?.Channel;
-        var channels = await _packagingService.GetChannelsAsync(cancellationToken, configuredChannelName);
 
         // Resolve channel sources and add them via RestoreAdditionalProjectSources
         // This is additive — it preserves the user's nuget.config and adds channel-specific sources
         var channelSources = new List<string>();
+        var channels = await _packagingService.GetChannelsAsync(cancellationToken, configuredChannelName);
         var matchedChannels = !string.IsNullOrEmpty(configuredChannelName)
             ? channels.Where(c => string.Equals(c.Name, configuredChannelName, StringComparison.OrdinalIgnoreCase))
             : channels.Where(c => c.Type == PackageChannelType.Explicit);
@@ -373,21 +305,24 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
         }
 
         // Create the project file
-        var doc = CreateProjectFile(integrations);
+        var projectFile = CreateProjectFile(integrations);
+
+        if (_restoreRootConfigDirectory is not null)
+        {
+            // Read configs in their original hierarchy so relative feeds and inherited settings
+            // retain their meaning even though the scanner project is generated elsewhere.
+            projectFile.AddProperty("RestoreRootConfigDirectory", _restoreRootConfigDirectory);
+        }
 
         // Add channel sources to the project
         if (channelSources.Count > 0)
         {
             var sourceList = string.Join(";", channelSources);
-            doc.Root!.Descendants("PropertyGroup").First()
-                .Add(new XElement("RestoreAdditionalProjectSources", sourceList));
+            projectFile.AddProperty("RestoreAdditionalProjectSources", sourceList);
         }
 
         // Add appsettings.json to output
-        doc.Root!.Add(new XElement("ItemGroup",
-            new XElement("None",
-                new XAttribute("Include", "appsettings.json"),
-                new XAttribute("CopyToOutputDirectory", "PreserveNewest"))));
+        projectFile.NoneItems.Add(new CSharpNoneItem("appsettings.json", CopyToOutputDirectory: "PreserveNewest"));
 
         // Create Directory.Packages.props to enable central package management
         // This ensures transitive dependencies use versions from the repo's Directory.Packages.props
@@ -402,22 +337,149 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
               <Import Project="{repoDirectoryPackagesProps}" />
             </Project>
             """;
-        File.WriteAllText(Path.Combine(_projectModelPath, "Directory.Packages.props"), directoryPackagesProps);
-
-        // Write empty Directory.Build.props/targets to prevent MSBuild from walking up and
-        // importing the repo's build infrastructure (Arcade SDK, etc.) which can rewrite
-        // project reference paths and cause resolution failures from the temp directory.
-        File.WriteAllText(Path.Combine(_projectModelPath, "Directory.Build.props"), "<Project />");
-        File.WriteAllText(Path.Combine(_projectModelPath, "Directory.Build.targets"), "<Project />");
 
         var projectFileName = Path.Combine(_projectModelPath, ProjectFileName);
+        var doc = projectFile.ToXDocument();
 
         // Log the full project XML for debugging
         _logger.LogTrace("Generated AppHostServer project file:\n{ProjectXml}", doc.ToString());
 
-        doc.Save(projectFileName);
+        // Every file this method owns, keyed by name relative to _projectModelPath. Writing the
+        // scaffold wipes obj/, so the whole set is fingerprinted together and rewritten only when
+        // something actually changed. Directory.Build.props/targets are deliberately empty: they
+        // stop MSBuild walking up into the repo's Arcade infrastructure, which rewrites project
+        // reference paths and breaks resolution from this directory.
+        var scaffold = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["Program.cs"] = programCs,
+            ["appsettings.json"] = appSettingsJson,
+            ["Directory.Packages.props"] = directoryPackagesProps,
+            ["Directory.Build.props"] = "<Project />",
+            ["Directory.Build.targets"] = "<Project />",
+            [ProjectFileName] = doc.ToString(),
+        };
+
+        // nuget.config is copied from the user's config rather than generated, so its *content*
+        // participates in the fingerprint. When the user's config disappears the key is absent,
+        // which both busts the hash and drives deletion of the stale copy below.
+        if (nugetConfigContent is not null)
+        {
+            scaffold["nuget.config"] = nugetConfigContent;
+        }
+
+        if (TryReuseScaffold(scaffold))
+        {
+            _logger.LogDebug("AppHostServer scaffold is up to date; preserving restore artifacts in {ProjectModelPath}", _projectModelPath);
+            return (projectFileName, channelName);
+        }
+
+        WriteScaffold(scaffold, doc);
 
         return (projectFileName, channelName);
+    }
+
+    /// <summary>
+    /// Determines whether the on-disk scaffold already matches <paramref name="scaffold"/> and is
+    /// backed by a usable NuGet restore, in which case it can be left alone.
+    /// </summary>
+    /// <remarks>
+    /// Rewriting the scaffold deletes obj/, which discards project.assets.json and the generated
+    /// nuget.g.props/targets. That forces a full restore and a full project-reference graph walk on
+    /// the next build. Doing that on every launch dominated in-repo polyglot startup, so the
+    /// destructive path is now taken only when the generated content actually changes.
+    ///
+    /// This deliberately does not attempt to detect changes to the repo sources this project
+    /// references. <c>BuildAsync</c> still runs on every launch, so MSBuild's own incremental
+    /// build remains the source of truth for those; skipping the scaffold only preserves the
+    /// restore output that describes an unchanged project.
+    /// </remarks>
+    private bool TryReuseScaffold(Dictionary<string, string> scaffold)
+    {
+        var fingerprint = ComputeScaffoldFingerprint(scaffold);
+
+        if (!string.Equals(GetProjectHash(), fingerprint, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        // A matching fingerprint only says the *inputs* are unchanged. The outputs still have to be
+        // present: a half-written scaffold or a hand-deleted file would otherwise be cached forever.
+        foreach (var fileName in scaffold.Keys)
+        {
+            if (!File.Exists(Path.Combine(_projectModelPath, fileName)))
+            {
+                return false;
+            }
+        }
+
+        // Preserving obj/ is the entire point of the cache, so there has to be something worth
+        // preserving. Without project.assets.json the next build would restore from scratch anyway,
+        // and an interrupted restore can leave obj/ populated but unusable.
+        if (!File.Exists(Path.Combine(_projectModelPath, "obj", "project.assets.json")))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private void WriteScaffold(Dictionary<string, string> scaffold, XDocument projectDocument)
+    {
+        // Clean obj folder to ensure fresh NuGet restore
+        var objPath = Path.Combine(_projectModelPath, "obj");
+        if (Directory.Exists(objPath))
+        {
+            try
+            {
+                Directory.Delete(objPath, recursive: true);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to delete obj folder at {ObjPath}", objPath);
+            }
+        }
+
+        foreach (var (fileName, content) in scaffold)
+        {
+            // The csproj is written through XDocument.Save so it keeps its XML declaration;
+            // the dictionary holds only the declaration-less string form used for hashing.
+            if (string.Equals(fileName, ProjectFileName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            File.WriteAllText(Path.Combine(_projectModelPath, fileName), content);
+        }
+
+        projectDocument.Save(Path.Combine(_projectModelPath, ProjectFileName));
+
+        // The user's nuget.config can be removed between launches. Leaving our copy behind would
+        // keep feeding the build sources the user has deleted.
+        if (!scaffold.ContainsKey("nuget.config"))
+        {
+            var staleNugetConfig = Path.Combine(_projectModelPath, "nuget.config");
+            if (File.Exists(staleNugetConfig))
+            {
+                File.Delete(staleNugetConfig);
+            }
+        }
+
+        // Persisted last so an interrupted write can never be mistaken for a complete scaffold.
+        SaveProjectHash(ComputeScaffoldFingerprint(scaffold));
+    }
+
+    private static string ComputeScaffoldFingerprint(Dictionary<string, string> scaffold)
+    {
+        var builder = new StringBuilder();
+
+        foreach (var fileName in scaffold.Keys.Order(StringComparer.Ordinal))
+        {
+            // The NUL separators keep file boundaries unambiguous: without them a rename that
+            // shifts content across the boundary could hash identically.
+            builder.Append(fileName).Append('\0').Append(scaffold[fileName]).Append('\0');
+        }
+
+        return SourceContentFingerprint.Compute(builder.ToString(), ScaffoldSchemaVersion);
     }
 
     /// <summary>
@@ -480,9 +542,9 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
         var assemblyPath = Path.Combine(BuildPath, ProjectDllName);
         var dotnetExe = _environment.IsWindows() ? "dotnet.exe" : "dotnet";
 
-        // Build the canonical ProcessStartInfo first, then translate to IsolatedProcessStartInfo
-        // only if the isolated path is requested. Sharing the env/arg construction avoids drift
-        // between the two branches — every env var and argument lives in exactly one place.
+        // Only the command line, working directory and environment of this ProcessStartInfo reach the
+        // child; ProcessExecutionFactory derives the launch mode (stdio, console, job) from the
+        // ProcessInvocationOptions below so every child is spawned the same way.
         var startInfo = new ProcessStartInfo(dotnetExe)
         {
             WorkingDirectory = _projectModelPath,
@@ -547,6 +609,7 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
             _logger.LogDebug("Enabling debug logging for AppHostServer");
         }
 
+        startInfo.RedirectStandardInput = true;
         startInfo.RedirectStandardOutput = true;
         startInfo.RedirectStandardError = true;
 
@@ -554,8 +617,9 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
 
         // The execution local is forward-referenced by the log callbacks so they can read the
         // child's pid per line. ProcessInvocationOptions.StandardOutputCallback is Action<string>
-        // (line only), but the AppHost wants the pid in each trace line (#16729). The callbacks
-        // only fire after Start(), by which point `execution` is assigned and ProcessId is valid.
+        // (line only), but the AppHost wants the pid in each trace line (#16729). ProcessExecution
+        // publishes the child pid before it starts stdout/stderr pumps so immediate output can read
+        // ProcessId.
         IProcessExecution execution = null!;
 
         void OnStdout(string line)
@@ -575,6 +639,7 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
             StandardOutputCallback = OnStdout,
             StandardErrorCallback = OnStderr,
             IsolateConsole = runControl?.IsolateConsole ?? false,
+            KillOnParentExit = runControl?.KillOnParentExit ?? false,
             GracefulShutdownSignaler = runControl?.GracefulShutdownSignaler,
             ShutdownService = runControl?.ShutdownService,
             // The graceful ladder always tree-kills on escalation; this fallback only matters when
@@ -587,7 +652,7 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
 
         try
         {
-            execution.Start();
+            await execution.StartAsync(CancellationToken.None).ConfigureAwait(false);
         }
         catch
         {
@@ -598,35 +663,20 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
         return new AppHostServerRunResult(_socketPath, outputCollector, execution);
     }
 
-    private static string? FindNuGetConfig(string workingDirectory)
+    private async Task<string?> FindNuGetConfigAsync(string workingDirectory, CancellationToken cancellationToken)
     {
         try
         {
-            var startInfo = new ProcessStartInfo("dotnet")
-            {
-                Arguments = "nuget config paths",
-                WorkingDirectory = workingDirectory,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
+            var (exitCode, configPaths) = await _dotNetCliRunner.GetNuGetConfigPathsAsync(
+                new DirectoryInfo(workingDirectory),
+                new ProcessInvocationOptions(),
+                cancellationToken);
 
-            using var process = Process.Start(startInfo);
-            if (process is null)
+            if (exitCode != 0)
             {
                 return null;
             }
 
-            var output = process.StandardOutput.ReadToEnd();
-            process.WaitForExit();
-
-            if (process.ExitCode != 0)
-            {
-                return null;
-            }
-
-            var configPaths = output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
             var workingDirFullPath = Path.GetFullPath(workingDirectory);
             var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var globalNuGetPath = Path.Combine(userProfile, ".nuget");
@@ -650,16 +700,16 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
 
             return null;
         }
-        catch
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return null;
         }
     }
 
-    private (string Os, string Arch) GetBuildPlatform()
+    internal static (string Os, string Arch) GetBuildPlatform(IEnvironment environment)
     {
-        var os = _environment.IsLinux() ? "linux"
-            : _environment.IsMacOS() ? "darwin"
+        var os = environment.IsLinux() ? "linux"
+            : environment.IsMacOS() ? "darwin"
             : "windows";
 
         var arch = RuntimeInformation.OSArchitecture switch
@@ -673,7 +723,7 @@ internal sealed class DotNetBasedAppHostServerProject : IAppHostServerProject
         return (os, arch);
     }
 
-    private static string GetDcpVersionFromRepo(string repoRoot, string buildOs, string buildArch)
+    internal static string GetDcpVersionFromRepo(string repoRoot, string buildOs, string buildArch)
     {
         const string fallbackVersion = "0.21.1";
 

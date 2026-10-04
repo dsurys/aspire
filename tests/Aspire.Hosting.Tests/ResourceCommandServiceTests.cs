@@ -6,6 +6,7 @@ using Aspire.Hosting.Testing;
 using Aspire.Hosting.Utils;
 using Microsoft.AspNetCore.InternalTesting;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Aspire.Hosting.Tests;
 
@@ -380,6 +381,28 @@ public class ResourceCommandServiceTests(ITestOutputHelper testOutputHelper)
         Assert.False(result.Success);
         Assert.True(result.Canceled);
         Assert.Null(result.Message);
+    }
+
+    [Fact]
+    public async Task ExecuteCommandAsync_CommandException_Failure()
+    {
+        using var builder = CreateBuilder();
+        const string diagnostic = "Failed to apply launch configuration. Process fallback is unavailable.";
+
+        var custom = builder.AddResource(new CustomResource("myResource"));
+        custom.WithCommand(
+            name: "mycommand",
+            displayName: "My command",
+            executeCommand: _ => throw new FailedToApplyEnvironmentException(diagnostic));
+
+        var app = builder.Build();
+        await app.StartAsync();
+
+        var result = await app.ResourceCommands.ExecuteCommandAsync(custom.Resource, "mycommand");
+
+        Assert.False(result.Success);
+        Assert.False(result.Canceled);
+        Assert.Equal(diagnostic, result.Message);
     }
 
     [Fact]
@@ -1288,6 +1311,180 @@ public class ResourceCommandServiceTests(ITestOutputHelper testOutputHelper)
         Assert.Equal("#submit", capturedArguments.GetString("selector"));
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task ExecuteCommandAsync_Arguments_IsolateInputStateAcrossInteractions(bool dismissFirst, bool cancelFirst)
+    {
+        using var builder = CreateBuilder();
+
+        // Exercise the real interaction lifecycle with prompting enabled, without starting a dashboard in the test.
+        builder.Services.AddSingleton<InteractionService>(services => new InteractionService(
+            services.GetRequiredService<ILogger<InteractionService>>(),
+            new DistributedApplicationOptions(),
+            services,
+            builder.Configuration,
+            services.GetRequiredService<IInteractionFileUploadStore>()));
+
+        var textDefinition = new InteractionInput
+        {
+            Name = "text",
+            InputType = InputType.Text
+        };
+        var messageDefinition = new InteractionInput
+        {
+            Name = "message",
+            InputType = InputType.Text,
+            Value = "default"
+        };
+        InteractionInputCollection? capturedArguments = null;
+        var executionCount = 0;
+        var custom = builder.AddResource(new CustomResource("myResource"));
+        custom.WithCommand(
+            name: "mycommand",
+            displayName: "My command",
+            executeCommand: context =>
+            {
+                capturedArguments = context.Arguments;
+                executionCount++;
+                return Task.FromResult(CommandResults.Success());
+            },
+            commandOptions: new CommandOptions { Arguments = [textDefinition, messageDefinition] });
+
+        await using var app = builder.Build();
+        await app.StartAsync().DefaultTimeout();
+        var interactionService = app.Services.GetRequiredService<InteractionService>();
+        InteractionInput? previousInput = null;
+
+        for (var invocation = 0; invocation < 2; invocation++)
+        {
+            capturedArguments = null;
+            using var cts = new CancellationTokenSource();
+            var resultTask = app.ResourceCommands.ExecuteCommandAsync(
+                "myResource",
+                "mycommand",
+                new ResourceCommandExecutionOptions { NonInteractive = false },
+                cts.Token);
+
+            var interaction = Assert.Single(interactionService.GetCurrentInteractions());
+            var inputs = Assert.IsType<Interaction.InputsInteractionInfo>(interaction.InteractionInfo).Inputs;
+            var input = inputs["text"];
+            Assert.NotSame(textDefinition, input);
+            Assert.NotSame(previousInput, input);
+            Assert.False(input.Disabled);
+            Assert.Equal("default", inputs.GetString("message"));
+
+            input.Disabled = true;
+            inputs["message"].Value = $"invocation-{invocation}";
+            var canceled = invocation == 0 && (dismissFirst || cancelFirst);
+            if (invocation == 0 && cancelFirst)
+            {
+                cts.Cancel();
+            }
+            else
+            {
+                await interactionService.ProcessInteractionFromClientAsync(
+                    interaction.InteractionId,
+                    (_, _, _) => new InteractionCompletionState { Complete = true, State = canceled ? null : inputs },
+                    CancellationToken.None).DefaultTimeout();
+            }
+
+            var result = await resultTask.DefaultTimeout();
+            Assert.Equal(!canceled, result.Success);
+            Assert.Equal(canceled, result.Canceled);
+            if (canceled)
+            {
+                Assert.Null(capturedArguments);
+            }
+            else
+            {
+                Assert.NotNull(capturedArguments);
+                Assert.Same(input, capturedArguments["text"]);
+                Assert.Equal($"invocation-{invocation}", capturedArguments.GetString("message"));
+            }
+
+            Assert.Empty(interactionService.GetCurrentInteractions());
+            Assert.False(textDefinition.Disabled);
+            Assert.Equal("default", messageDefinition.Value);
+            previousInput = input;
+        }
+
+        Assert.Equal(dismissFirst || cancelFirst ? 1 : 2, executionCount);
+    }
+
+    [Fact]
+    public async Task ExecuteCommandAsync_InteractiveDisabledDynamicArgumentWithDefaultValue_Succeeds()
+    {
+        using var builder = CreateBuilder();
+
+        var testInteractionService = new TestInteractionService();
+        builder.Services.AddSingleton<IInteractionService>(testInteractionService);
+
+        InteractionInputCollection? capturedArguments = null;
+        var custom = builder.AddResource(new CustomResource("myResource"));
+        custom.WithCommand(
+            name: "mycommand",
+            displayName: "My command",
+            executeCommand: context =>
+            {
+                capturedArguments = context.Arguments;
+                return Task.FromResult(CommandResults.Success());
+            },
+            commandOptions: new CommandOptions
+            {
+                Arguments =
+                [
+                    new InteractionInput
+                    {
+                        Name = "generateTraces",
+                        InputType = InputType.Boolean,
+                        Required = true,
+                        Value = "true"
+                    },
+                    new InteractionInput
+                    {
+                        Name = "traceCount",
+                        InputType = InputType.Number,
+                        Required = true,
+                        Value = "50000",
+                        DynamicLoading = new InputLoadOptions
+                        {
+                            DependsOnInputs = ["generateTraces"],
+                            LoadCallback = context =>
+                            {
+                                context.Input.Disabled = !context.AllInputs.GetBoolean("generateTraces");
+                                return Task.CompletedTask;
+                            }
+                        }
+                    }
+                ]
+            });
+
+        var app = builder.Build();
+        await app.StartAsync();
+
+        var resultTask = app.ResourceCommands.ExecuteCommandAsync(
+            "myResource",
+            "mycommand",
+            new ResourceCommandExecutionOptions { NonInteractive = false },
+            CancellationToken.None).DefaultTimeout();
+
+        var interaction = await testInteractionService.Interactions.Reader.ReadAsync().DefaultTimeout();
+        interaction.Inputs["generateTraces"].Value = "false";
+        interaction.Inputs["traceCount"].Disabled = true;
+        interaction.CompletionTcs.SetResult(InteractionResult.Ok(interaction.Inputs));
+
+        var result = await resultTask;
+
+        Assert.True(result.Success);
+        Assert.NotNull(capturedArguments);
+        Assert.False(capturedArguments.GetBoolean("generateTraces"));
+        Assert.Equal(50000, capturedArguments.GetInt32("traceCount"));
+        Assert.True(capturedArguments["traceCount"].Disabled);
+        Assert.Empty(capturedArguments["traceCount"].ValidationErrors);
+    }
+
     [Fact]
     public async Task ExecuteCommandAsync_NonInteractiveWithoutArguments_DoesNotPrompt()
     {
@@ -1555,6 +1752,7 @@ public class ResourceCommandServiceTests(ITestOutputHelper testOutputHelper)
         using var cts = AsyncTestHelpers.CreateDefaultTimeoutTokenSource(TestConstants.LongTimeoutDuration);
         await resourceNotificationService.WaitForResourceAsync(project.Resource.Name, e => KnownResourceStates.BuildableStates.Contains(e.Snapshot.State?.Text), cts.Token).DefaultTimeout(TimeSpan.FromMinutes(2));
 
+        var buildCountPath = Path.Combine(workspace.WorkspaceRoot.FullName, "build-count.txt");
         var result = await app.ResourceCommands.ExecuteCommandAsync(project.Resource, KnownResourceCommands.RebuildCommand).DefaultTimeout(TimeSpan.FromMinutes(2));
 
         Assert.True(result.Success);
@@ -1562,6 +1760,14 @@ public class ResourceCommandServiceTests(ITestOutputHelper testOutputHelper)
         Assert.Equal(CommandResultFormat.Text, result.Data.Format);
         Assert.Contains("[build] Building project...", result.Data.Value);
         Assert.Contains(rebuildOutputMarker, result.Data.Value);
+        var firstBuildCount = File.ReadAllLines(buildCountPath).Length;
+
+        var secondResult = await app.ResourceCommands.ExecuteCommandAsync(project.Resource, KnownResourceCommands.RebuildCommand).DefaultTimeout(TimeSpan.FromMinutes(2));
+
+        Assert.True(secondResult.Success);
+        Assert.NotNull(secondResult.Data);
+        Assert.Contains(rebuildOutputMarker, secondResult.Data.Value);
+        Assert.Equal(firstBuildCount + 1, File.ReadAllLines(buildCountPath).Length);
     }
 
     [Fact]
@@ -1614,6 +1820,7 @@ public class ResourceCommandServiceTests(ITestOutputHelper testOutputHelper)
               </PropertyGroup>
 
               <Target Name="EmitAspireRebuildOutputMarker" AfterTargets="Build">
+                <WriteLinesToFile File="$(MSBuildProjectDirectory)/build-count.txt" Lines="built" Overwrite="false" />
                 <Message Importance="High" Text="{{buildOutputMarker}}" />
               </Target>
             </Project>
@@ -1647,7 +1854,7 @@ public class ResourceCommandServiceTests(ITestOutputHelper testOutputHelper)
                 },
                 commandOptions: new CommandOptions
                 {
-                    Progress = new CommandProgressOptions { Message = "Processing..." }
+                    Progress = new CommandProgressOptions { Message = "Processing...", Title = "Cancelable Command" }
                 });
 
         var app = builder.Build();
@@ -1658,6 +1865,7 @@ public class ResourceCommandServiceTests(ITestOutputHelper testOutputHelper)
         // Wait for the Work callback to write the interaction and for the command to start.
         var interaction = await testInteractionService.Interactions.Reader.ReadAsync().DefaultTimeout();
         Assert.Equal(InteractionType.Progress, interaction.Type);
+        Assert.Equal("Cancelable Command", interaction.Title);
         Assert.Equal("Processing...", interaction.Message);
         await commandStarted.Task.DefaultTimeout();
 
@@ -1669,6 +1877,56 @@ public class ResourceCommandServiceTests(ITestOutputHelper testOutputHelper)
         Assert.True(testInteractionService.PromptProgressCalled);
         Assert.False(result.Success);
         Assert.True(result.Canceled);
+    }
+
+    [Fact]
+    public async Task ExecuteCommandAsync_WithProgressOptions_ReturnsCanceledWhenCommandHandlesProgressCancellation()
+    {
+        using var builder = CreateBuilder();
+
+        var testInteractionService = new TestInteractionService();
+        builder.Services.AddSingleton<IInteractionService>(testInteractionService);
+
+        var commandStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var custom = builder.AddResource(new CustomResource("myResource"));
+        custom.WithCommand(name: "cancelable-command",
+                displayName: "Cancelable Command",
+                executeCommand: async e =>
+                {
+                    commandStarted.SetResult();
+
+                    try
+                    {
+                        await Task.Delay(Timeout.Infinite, e.CancellationToken);
+                    }
+                    catch (OperationCanceledException) when (e.CancellationToken.IsCancellationRequested)
+                    {
+                        return CommandResults.Success("Cleanup completed.");
+                    }
+
+                    return CommandResults.Success();
+                },
+                commandOptions: new CommandOptions
+                {
+                    Progress = new CommandProgressOptions { Message = "Processing..." }
+                });
+
+        var app = builder.Build();
+        await app.StartAsync();
+
+        var resultTask = app.ResourceCommands.ExecuteCommandAsync("myResource", "cancelable-command");
+
+        var interaction = await testInteractionService.Interactions.Reader.ReadAsync().DefaultTimeout();
+        Assert.Equal(InteractionType.Progress, interaction.Type);
+        await commandStarted.Task.DefaultTimeout();
+
+        interaction.CompletionTcs.SetResult(InteractionResult.Cancel<bool>());
+
+        var result = await resultTask.DefaultTimeout();
+
+        Assert.False(result.Success);
+        Assert.True(result.Canceled);
+        Assert.Null(result.Message);
     }
 
     [Fact]

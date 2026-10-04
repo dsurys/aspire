@@ -8,16 +8,13 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Globalization;
-using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Aspire.Dashboard.Model;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Diagnostics;
 using Aspire.Hosting.Dcp.Model;
 using Aspire.Hosting.Eventing;
 using Aspire.Hosting.Utils;
-using Json.Patch;
 using k8s;
 using k8s.Autorest;
 using k8s.Models;
@@ -29,24 +26,14 @@ using Polly.Timeout;
 
 namespace Aspire.Hosting.Dcp;
 
-internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAsyncDisposable
+internal sealed class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAsyncDisposable
 {
     internal const string DebugSessionPortVar = "DEBUG_SESSION_PORT";
-
-    // The base name for ephemeral container (Docker, Podman etc) networks
-    internal const string DefaultAspireNetworkName = "aspire-session-network";
-
-    // The base name for persistent container (Docker, Podman etc) networks
-    internal const string DefaultAspirePersistentNetworkName = "aspire-persistent-network";
 
     // Disposal of the DcpExecutor means shutting down watches and log streams,
     // and asking DCP to start the shutdown process. If we cannot complete these tasks within 10 seconds,
     // it probably means DCP crashed and there is no point trying further.
     private static readonly TimeSpan s_disposeTimeout = TimeSpan.FromSeconds(10);
-
-    // Regex for normalizing application names.
-    [GeneratedRegex("""^(?<name>.+?)\.?AppHost$""", RegexOptions.ExplicitCapture | RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant)]
-    private static partial Regex ApplicationNameRegex();
 
     private readonly ILogger<DistributedApplication> _distributedApplicationLogger;
     private readonly IKubernetesService _kubernetesService;
@@ -75,11 +62,12 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
 
     private readonly ExecutableCreator _executableCreator;
     private readonly ContainerCreator _containerCreator;
+    private readonly ContainerNetworkEndpointProvisioner _containerNetworkEndpointProvisioner;
     private readonly ProxylessEndpointPortAllocator _proxylessEndpointPortAllocator;
 
-    // We need to preserve the container creation context from the application startup phase
-    // so that container explicit start does not suffer from timing issues.
-    private readonly TaskCompletionSource<ContainerCreationContext> _containerContextSource;
+    // Preserve the application-run endpoint context so explicit-start workloads use the same
+    // container-network prerequisites and shared provisioning lifetime as initial workloads.
+    private readonly TaskCompletionSource<ContainerNetworkEndpointContext> _containerNetworkEndpointContextSource;
 
     // Internal for testing.
     internal ResiliencePipeline<bool> DeleteResourceRetryPipeline { get; set; }
@@ -102,6 +90,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
                         DcpAppResourceStore appResources,
                         ExecutableCreator executableCreator,
                         ContainerCreator containerCreator,
+                        ContainerNetworkEndpointProvisioner containerNetworkEndpointProvisioner,
                         ProfilingTelemetry profilingTelemetry,
                         ProxylessEndpointPortAllocator proxylessEndpointPortAllocator,
                         IUserSecretsManager userSecretsManager)
@@ -125,9 +114,10 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
 
         DeleteResourceRetryPipeline = DcpPipelineBuilder.BuildDeleteRetryPipeline(logger);
 
-        _containerContextSource = new TaskCompletionSource<ContainerCreationContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _containerNetworkEndpointContextSource = new TaskCompletionSource<ContainerNetworkEndpointContext>(TaskCreationOptions.RunContinuationsAsynchronously);
         _executableCreator = executableCreator;
         _containerCreator = containerCreator;
+        _containerNetworkEndpointProvisioner = containerNetworkEndpointProvisioner;
         _proxylessEndpointPortAllocator = proxylessEndpointPortAllocator;
     }
 
@@ -155,7 +145,8 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
 
         try
         {
-            _containerCreator.PrepareContainerNetworks();
+            _containerNetworkEndpointProvisioner.PrepareContainerNetwork();
+            var containerVolumes = _containerCreator.PrepareContainerVolumes();
 
             using (var prepareServicesActivity = ProfilingTelemetry.StartDcpPrepareServices(_configuration))
             {
@@ -178,7 +169,8 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
                 {
                     containers = _containerCreator.PrepareObjects().ToArray();
                     _containerCreator.PrepareContainerExecutables();
-                    executables = _executableCreator.PrepareObjects().ToArray();
+                    executables = _executableCreator.PrepareObjects(ct).ToArray();
+                    AllocateExecutableTargetPorts(executables);
 
                     prepareResourcesActivity.SetDcpPreparedResourceCounts(containers.Length, executables.Length);
                 }
@@ -206,6 +198,18 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
             }, ct);
 
             var createContainerNetworks = Task.Run(() => CreateAllDcpObjectsAsync<ContainerNetwork>(ct), ct);
+
+            var createContainerVolumes = Task.Run(async () =>
+            {
+                await CreateDcpObjectsAsync(containerVolumes, ct).ConfigureAwait(false);
+                var observedVolumes = await WaitForStateAsync(
+                    containerVolumes,
+                    volume => volume.Status?.State,
+                    [ContainerVolumeState.Ready],
+                    TimeSpan.FromMinutes(1),
+                    ct).ConfigureAwait(false);
+                EnsureContainerVolumesReady(observedVolumes);
+            }, ct);
 
             var createWorkloadEndpoints = Task.Run(async () =>
             {
@@ -244,22 +248,25 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
                 }
             }, ct);
 
+            // Container creation and executable configuration may both require endpoints expressed within the container network.
+            var endpointContext = new ContainerNetworkEndpointContext(
+                createContainerNetworks,
+                createWorkloadEndpoints,
+                _shutdownCancellation.Token);
+            _containerNetworkEndpointContextSource.SetResult(endpointContext);
+
             var createExecutables = Task.Run(async () =>
             {
                 await createWorkloadEndpoints.ConfigureAwait(false);
 
-                await CreateRenderedResourcesAsync(_executableCreator, executables, EmptyCreationContext.s_instance, ct).ConfigureAwait(false);
+                await CreateRenderedResourcesAsync(_executableCreator, executables, endpointContext, ct).ConfigureAwait(false);
             }, ct);
-
-            // Configuring containers that use the tunnel require these host network-side endpoints for Executables to be ready.
-            var cctx = new ContainerCreationContext(createContainerNetworks, createWorkloadEndpoints, ct);
-            _containerContextSource.SetResult(cctx);
 
             var createContainers = Task.Run(async () =>
             {
-                await createWorkloadEndpoints.ConfigureAwait(false);
+                await Task.WhenAll(createWorkloadEndpoints, createContainerVolumes).ConfigureAwait(false);
 
-                await CreateRenderedResourcesAsync(_containerCreator, containers, cctx, ct).ConfigureAwait(false);
+                await CreateRenderedResourcesAsync(_containerCreator, containers, endpointContext, ct).ConfigureAwait(false);
             }, ct);
 
             // Now wait for all "leaf" creations to complete.
@@ -269,7 +276,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
         {
             activity.SetError(ex);
             _shutdownCancellation.Cancel();
-            _containerContextSource.TrySetException(ex);
+            _containerNetworkEndpointContextSource.TrySetException(ex);
             throw;
         }
     }
@@ -332,52 +339,12 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
         }
     }
 
-    /// <summary>
-    /// Normalizes the application name for use in physical container resource names (only guaranteed valid as a suffix).
-    /// Removes the ".AppHost" suffix if present and takes only characters that are valid in resource names.
-    /// Invalid characters are simply omitted from the name as the result doesn't need to be identical.
-    /// </summary>
-    /// <param name="applicationName">The application name to normalize.</param>
-    /// <returns>The normalized application name with invalid characters removed.</returns>
-    internal static string NormalizeApplicationName(string applicationName)
-    {
-        if (string.IsNullOrEmpty(applicationName))
-        {
-            return applicationName;
-        }
-
-        applicationName = ApplicationNameRegex().Match(applicationName) switch
-        {
-            Match { Success: true } match => match.Groups["name"].Value,
-            _ => applicationName
-        };
-
-        if (string.IsNullOrEmpty(applicationName))
-        {
-            return applicationName;
-        }
-
-        var normalizedName = new StringBuilder();
-        for (var i = 0; i < applicationName.Length; i++)
-        {
-            if ((applicationName[i] is >= 'a' and <= 'z') ||
-                (applicationName[i] is >= 'A' and <= 'Z') ||
-                (applicationName[i] is >= '0' and <= '9') ||
-                (applicationName[i] is '_' or '-' or '.'))
-            {
-                normalizedName.Append(applicationName[i]);
-            }
-        }
-
-        return normalizedName.ToString();
-    }
-
     internal static string GetResourceType<T>(T resource, IResource appModelResource) where T : CustomResource
     {
         return resource switch
         {
             Container => KnownResourceTypes.Container,
-            Executable => appModelResource is ProjectResource ? KnownResourceTypes.Project : KnownResourceTypes.Executable,
+            Executable => appModelResource.GetResourceType(),
             ContainerExec => KnownResourceTypes.ContainerExec,
             _ => throw new InvalidOperationException($"Unknown resource type {resource.GetType().Name}")
         };
@@ -544,6 +511,23 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
         }
     }
 
+    internal static void EnsureContainerVolumesReady(IEnumerable<ContainerVolume> volumes)
+    {
+        var unreadyVolumes = volumes
+            .Where(volume => !string.Equals(volume.Status?.State, ContainerVolumeState.Ready, StringComparison.Ordinal))
+            .ToArray();
+        if (unreadyVolumes.Length == 0)
+        {
+            return;
+        }
+
+        var details = string.Join(
+            ", ",
+            unreadyVolumes.Select(volume =>
+                $"'{volume.Spec.Name ?? volume.Metadata.Name}': current state is '{volume.Status?.State ?? "(unknown)"}'"));
+        throw new DistributedApplicationException($"One or more container volumes did not become ready: {details}");
+    }
+
     // Waits until each provided object reports a state that is in finalStates, or until timeout elapses.
     // Returns the latest observed instance for each input object so callers can inspect Status.
     public async Task<IReadOnlyList<TDcpResource>> WaitForStateAsync<TDcpResource>(
@@ -662,7 +646,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
             foreach (var endpoint in sp.Endpoints)
             {
                 endpoint.SetResolvedIsProxied(GetEffectiveIsProxied(sp.ModelResource, endpoint, _options.Value.RandomizePorts));
-                ValidateEndpointBeforeDynamicPublicPortAllocation(sp.ModelResource, endpoint);
+                DcpModelUtilities.ValidateEndpointPorts(sp.ModelResource, endpoint);
 
                 if (TryGetEffectiveFixedPublicPort(sp.ModelResource, endpoint, _options.Value.RandomizePorts, out var fixedPublicPort))
                 {
@@ -672,6 +656,13 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
                 if (TryGetPersistedProxylessEndpointPort(sp.ModelResource, endpoint) is int persistedPort)
                 {
                     _proxylessEndpointPortAllocator.ExcludePort(persistedPort);
+                }
+
+                if (sp.ModelResource is IComputeResource &&
+                    !sp.ModelResource.IsContainer() &&
+                    EndpointAnnotation.NormalizePort(endpoint.TargetPort) is int fixedTargetPort)
+                {
+                    _proxylessEndpointPortAllocator.ExcludePort(fixedTargetPort);
                 }
             }
         }
@@ -740,7 +731,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
 
         foreach (var re in hostResources)
         {
-            var containerNetworkServices = _containerCreator.CreateContainerNetworkServicesForHostResource(re);
+            var containerNetworkServices = _containerNetworkEndpointProvisioner.CreateContainerNetworkServices(re);
             _appResources.AddRange(containerNetworkServices.Select(cns => cns.ServiceResource));
         }
     }
@@ -765,6 +756,49 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
         return !resource.HasPersistentLifetime();
     }
 
+    private void AllocateExecutableTargetPorts(IEnumerable<RenderedModelResource<Executable>> executables)
+    {
+        // Allocate per rendered executable so replicas receive distinct target ports.
+        foreach (var executable in executables)
+        {
+            if (!executable.DcpResource.TryGetAnnotationAsObjectList<ServiceProducerAnnotation>(
+                CustomResource.ServiceProducerAnnotation,
+                out var serviceProducerAnnotations))
+            {
+                continue;
+            }
+
+            var annotationsByServiceName = serviceProducerAnnotations.ToDictionary(a => a.ServiceName, StringComparer.Ordinal);
+            var annotationsChanged = false;
+
+            foreach (var serviceProducer in executable.ServicesProduced)
+            {
+                var endpoint = serviceProducer.EndpointAnnotation;
+                if (!endpoint.IsProxied ||
+                    EndpointAnnotation.NormalizePort(endpoint.TargetPort) is not null)
+                {
+                    continue;
+                }
+
+                var annotation = annotationsByServiceName[serviceProducer.Service.Metadata.Name];
+
+                // DCP's dynamic producer-port allocation probes an ephemeral port, releases it, and
+                // later passes it to the child process. Allocate from Aspire's non-ephemeral range
+                // instead so unrelated outbound connections cannot claim the port during that gap.
+                annotation.Port = _proxylessEndpointPortAllocator.AllocatePort(endpoint.Protocol);
+                annotationsChanged = true;
+            }
+
+            if (annotationsChanged)
+            {
+                // Annotation lists are deserialized copies, so persist the allocated ports back to the DCP resource.
+                executable.DcpResource.SetAnnotationAsObjectList(
+                    CustomResource.ServiceProducerAnnotation,
+                    serviceProducerAnnotations);
+            }
+        }
+    }
+
     /// <summary>
     /// Determines whether an endpoint definition has a fixed public port DCP should reserve or pre-exclude.
     /// </summary>
@@ -772,6 +806,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
     /// Use this when deciding whether DCP should bind a service to a known public port. Proxied endpoints
     /// with randomized ports deliberately do not report a fixed port so DCP can allocate the public port
     /// instead of reserving the configured value.
+    /// Port 0 requests dynamic allocation and therefore does not count as a fixed public port.
     /// Container endpoint definitions keep the public host port separate from the target container port, so
     /// only an explicitly specified public port counts as fixed. Executable endpoint definitions use the same
     /// port value for the process and the public endpoint, so the effective public port can come from either
@@ -779,7 +814,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
     /// </remarks>
     private static bool TryGetEffectiveFixedPublicPort(IResource resource, EndpointAnnotation endpoint, bool randomizePorts, out int publicPort)
     {
-        var effectivePublicPort = resource.IsContainer() ? endpoint.SpecifiedPort : endpoint.Port;
+        var effectivePublicPort = EndpointAnnotation.NormalizePort(resource.IsContainer() ? endpoint.SpecifiedPort : endpoint.Port);
 
         // When port randomization is enabled, proxied endpoints intentionally ignore the defined public
         // port so DCP can allocate one dynamically instead.
@@ -817,7 +852,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
             publicPort = _proxylessEndpointPortAllocator.AllocatePort(endpoint);
             _logger.LogDebug("Allocated public port {Port} for proxyless endpoint '{EndpointName}' on resource '{ResourceName}'.", publicPort, endpoint.Name, resource.Name);
 
-            if (resource.HasPersistentLifetime())
+            if (resource.HasPersistentLifetime() && !_options.Value.RandomizePorts)
             {
                 var secretKey = GetPersistedProxylessEndpointPortKey(resource, endpoint);
                 if (!_userSecretsManager.TrySetSecret(secretKey, publicPort.ToString(CultureInfo.InvariantCulture)))
@@ -836,12 +871,18 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
 
     private static bool NeedsPublicPort(IResource resource, EndpointAnnotation endpoint)
     {
-        return !endpoint.IsProxied && !TryGetEffectiveFixedPublicPort(resource, endpoint, randomizePorts: false, out _);
+        // DCP can allocate a port only for resources it launches as workloads. This includes compute
+        // resources and annotation-backed containers; integration-owned endpoints publish their own addresses.
+        return (resource is IComputeResource || resource.IsContainer()) &&
+            !endpoint.IsProxied &&
+            !TryGetEffectiveFixedPublicPort(resource, endpoint, randomizePorts: false, out _);
     }
 
     private int? TryGetPersistedProxylessEndpointPort(IResource resource, EndpointAnnotation endpoint)
     {
-        if (!resource.HasPersistentLifetime() || !NeedsPublicPort(resource, endpoint))
+        if (_options.Value.RandomizePorts ||
+            !resource.HasPersistentLifetime() ||
+            !NeedsPublicPort(resource, endpoint))
         {
             return null;
         }
@@ -867,14 +908,6 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
         // Schema suggested by https://github.com/microsoft/aspire/issues/13597:
         // Resources:<resource-name>:<endpoint-name>:port
         return $"Resources:{resource.Name}:{endpoint.Name}:port";
-    }
-
-    private static void ValidateEndpointBeforeDynamicPublicPortAllocation(IResource resource, EndpointAnnotation endpoint)
-    {
-        if (resource.IsContainer() && endpoint.TargetPort is null)
-        {
-            throw new InvalidOperationException($"The endpoint '{endpoint.Name}' for container resource '{resource.Name}' must specify the {nameof(EndpointAnnotation.TargetPort)} value");
-        }
     }
 
     internal static void SetInitialResourceState(IResource resource, IAnnotationHolder annotationHolder)
@@ -949,6 +982,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
                 await _executorEvents.PublishAsync(new OnResourceChangedContext(
                     _shutdownCancellation.Token, resourceType, modelResource,
                     r.DcpResourceName, new ResourceStatus(null, null, null),
+                    PreviousState: null,
                     snapshotBuild)
                 ).ConfigureAwait(false);
             }
@@ -967,6 +1001,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
                         cancellationToken, resourceType, modelResource,
                         r.DcpResource.Metadata.Name,
                         new ResourceStatus(KnownResourceStates.NotStarted, null, null),
+                        PreviousState: null,
                         s => s with
                         {
                             State = new ResourceStateSnapshot(KnownResourceStates.NotStarted, null)
@@ -987,6 +1022,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
                         cancellationToken, resourceType, modelResource,
                         r.DcpResource.Metadata.Name,
                         new ResourceStatus(KnownResourceStates.NotStarted, null, null),
+                        PreviousState: null,
                         s => s with
                         {
                             State = new ResourceStateSnapshot(KnownResourceStates.NotStarted, null)
@@ -1111,7 +1147,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
 
         var changed = JsonSerializer.SerializeToNode(copy);
 
-        var jsonPatch = current.CreatePatch(changed);
+        var jsonPatch = JsonPatch.Create(current, changed);
         return new V1Patch(jsonPatch, V1Patch.PatchType.JsonPatch);
     }
 
@@ -1238,8 +1274,8 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
 
                     await PublishConnectionStringAvailableEventAsync(resourceReference.ModelResource, cancellationToken).ConfigureAwait(false);
                     await _executorEvents.PublishAsync(new OnResourceStartingContext(cancellationToken, resourceType, resourceReference.ModelResource, resourceReference.DcpResourceName)).ConfigureAwait(false);
-                    var cctx = await _containerContextSource.Task.ConfigureAwait(false);
-                    await _containerCreator.CreateObjectAsync(cr, cctx, resourceLogger, this, cancellationToken).ConfigureAwait(false);
+                    var containerEndpointContext = await _containerNetworkEndpointContextSource.Task.ConfigureAwait(false);
+                    await _containerCreator.CreateObjectAsync(cr, containerEndpointContext, resourceLogger, this, cancellationToken).ConfigureAwait(false);
                     await PublishConnectionStringAvailableEventAsync(resourceReference.ModelResource, cancellationToken).ConfigureAwait(false);
                     break;
                 case RenderedModelResource<Executable> er:
@@ -1250,7 +1286,8 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
 
                     await PublishConnectionStringAvailableEventAsync(resourceReference.ModelResource, cancellationToken).ConfigureAwait(false);
                     await _executorEvents.PublishAsync(new OnResourceStartingContext(cancellationToken, resourceType, resourceReference.ModelResource, resourceReference.DcpResourceName)).ConfigureAwait(false);
-                    await _executableCreator.CreateObjectAsync(er, EmptyCreationContext.s_instance, resourceLogger, this, cancellationToken).ConfigureAwait(false);
+                    var executableEndpointContext = await _containerNetworkEndpointContextSource.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    await _executableCreator.CreateObjectAsync(er, executableEndpointContext, resourceLogger, this, cancellationToken).ConfigureAwait(false);
                     await PublishConnectionStringAvailableEventAsync(resourceReference.ModelResource, cancellationToken).ConfigureAwait(false);
                     break;
 
@@ -1258,18 +1295,17 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
                     throw new InvalidOperationException($"Unexpected resource type: {appResource.DcpResourceKind}");
             }
         }
-        catch (FailedToApplyEnvironmentException ex)
-        {
-            // For this exception we don't want the noise of the stack trace, we've already
-            // provided more detail where we detected the issue (e.g. envvar name). To get
-            // more diagnostic information reduce logging level for DCP log category to Debug.
-            await _executorEvents.PublishAsync(new OnResourceFailedToStartContext(cancellationToken, resourceType, resourceReference.ModelResource, resourceReference.DcpResourceName, ex.Message)).ConfigureAwait(false);
-        }
         catch (Exception ex)
         {
             activity.SetError(ex);
-            _logger.LogError(ex, "Failed to start resource {ResourceName}", resourceReference.ModelResource.Name);
-            await _executorEvents.PublishAsync(new OnResourceFailedToStartContext(cancellationToken, resourceType, resourceReference.ModelResource, resourceReference.DcpResourceName)).ConfigureAwait(false);
+            if (ex is not FailedToApplyEnvironmentException)
+            {
+                // FailedToApplyEnvironmentException is logged with actionable details where it is detected,
+                // so avoid duplicating that entry with a generic stack trace.
+                _logger.LogError(ex, "Failed to start resource {ResourceName}", resourceReference.ModelResource.Name);
+            }
+
+            await _executorEvents.PublishAsync(new OnResourceFailedToStartContext(cancellationToken, resourceType, resourceReference.ModelResource, resourceReference.DcpResourceName, ex.Message)).ConfigureAwait(false);
             throw;
         }
     }
@@ -1282,6 +1318,8 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
         ForgetCachedCallbackResults(resource.ModelResource);
         ForgetConnectionStringAvailableEvent(resource.ModelResource);
 
+        // The delete watch can clear its observation while the API deletion is still being polled.
+        string? deletedUid = null;
         var result = await DeleteResourceRetryPipeline.ExecuteAsync(async (resourceName, attemptCancellationToken) =>
         {
             string? uid = null;
@@ -1293,6 +1331,7 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
             {
                 var r = await _kubernetesService.DeleteAsync<T>(resourceName, cancellationToken: attemptCancellationToken).ConfigureAwait(false);
                 uid = r.Uid();
+                deletedUid = uid;
 
                 _logger.LogDebug("Delete request for '{ResourceName}' successfully completed. Resource to delete has UID '{Uid}'.", resourceName, uid);
             }
@@ -1330,6 +1369,9 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
         {
             throw new DistributedApplicationException($"Failed to delete '{resource.DcpResourceName}' successfully before restart.");
         }
+
+        // Do not suppress updates from an object whose deletion failed.
+        _resourceWatcher.MarkPreviousIncarnationSuperseded(T.ObjectKind, resource.DcpResourceName, deletedUid);
     }
 
     /// <summary>
@@ -1348,6 +1390,14 @@ internal sealed partial class DcpExecutor : IDcpExecutor, IDcpObjectFactory, IAs
         if (resource.TryGetAnnotationsOfType<CommandLineArgsCallbackAnnotation>(out var argsCallbacks))
         {
             foreach (var callback in argsCallbacks)
+            {
+                ((ICallbackResourceAnnotation<CommandLineArgsCallbackContext, IList<object>>)callback).ForgetCachedResult();
+            }
+        }
+
+        if (resource.TryGetAnnotationsOfType<LaunchToolArgsCallbackAnnotation>(out var launchToolArgsCallbacks))
+        {
+            foreach (var callback in launchToolArgsCallbacks)
             {
                 ((ICallbackResourceAnnotation<CommandLineArgsCallbackContext, IList<object>>)callback).ForgetCachedResult();
             }

@@ -28,6 +28,7 @@ public class DcpConnectionHealthCheckTests(ITestOutputHelper outputHelper)
         };
         var check = new DcpConnectionHealthCheck(
             new NullLayoutDiscovery(),
+            new NullBundleService(),
             tester,
             CreateExecutionContext(workspace),
             NullLogger<DcpConnectionHealthCheck>.Instance);
@@ -45,6 +46,7 @@ public class DcpConnectionHealthCheckTests(ITestOutputHelper outputHelper)
         var dcpDirectory = workspace.WorkspaceRoot.CreateSubdirectory("dcp");
         var check = new DcpConnectionHealthCheck(
             new FixedLayoutDiscovery(LayoutComponent.Dcp, dcpDirectory.FullName),
+            new NullBundleService(),
             new TestDcpConnectionChecker(),
             CreateExecutionContext(workspace),
             NullLogger<DcpConnectionHealthCheck>.Instance);
@@ -54,6 +56,114 @@ public class DcpConnectionHealthCheckTests(ITestOutputHelper outputHelper)
         Assert.Equal(DcpConnectionHealthCheck.BundleCheckName, result.Name);
         Assert.Equal(EnvironmentCheckStatus.Fail, result.Status);
         Assert.Contains("Developer Control Plane (DCP) executable not found", result.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CheckAsync_WhenNoLayoutIsDiscovered_ExtractsBundleBeforeProbingForDcp()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var dcpDirectory = CreateDcpDirectoryWithExecutable(workspace);
+        var probedPaths = new List<string>();
+        var tester = new TestDcpConnectionChecker
+        {
+            TestConnectionAsyncCallback = (path, useDeveloperCertificate, _) =>
+            {
+                probedPaths.Add(path);
+                return Task.FromResult(TestDcpConnectionChecker.CreateResult(useDeveloperCertificate, EnvironmentCheckStatus.Pass, "passed"));
+            }
+        };
+
+        // On a fresh install nothing has extracted the bundle yet, so discovery finds no layout. The check has
+        // to extract it rather than report DCP as missing.
+        var bundleService = new RecordingBundleService(dcpDirectory.FullName);
+        var check = new DcpConnectionHealthCheck(
+            new NullLayoutDiscovery(),
+            bundleService,
+            tester,
+            CreateExecutionContext(workspace),
+            NullLogger<DcpConnectionHealthCheck>.Instance);
+
+        var result = Assert.Single(await check.CheckAsync());
+
+        Assert.Equal(1, bundleService.EnsureExtractedAndAcquireLayoutCallCount);
+        Assert.Equal(EnvironmentCheckStatus.Pass, result.Status);
+        Assert.All(probedPaths, path => Assert.Equal(dcpDirectory.FullName, path));
+        Assert.NotEmpty(probedPaths);
+    }
+
+    [Fact]
+    public async Task CheckAsync_PrefersDiscoveredLayoutOverExtraction()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var discoveredDcpDirectory = CreateDcpDirectoryWithExecutable(workspace, "discovered-dcp");
+        var extractedDcpDirectory = CreateDcpDirectoryWithExecutable(workspace, "extracted-dcp");
+        var probedPaths = new List<string>();
+        var tester = new TestDcpConnectionChecker
+        {
+            TestConnectionAsyncCallback = (path, useDeveloperCertificate, _) =>
+            {
+                probedPaths.Add(path);
+                return Task.FromResult(TestDcpConnectionChecker.CreateResult(useDeveloperCertificate, EnvironmentCheckStatus.Pass, "passed"));
+            }
+        };
+
+        // Discovery honors ASPIRE_DCP_PATH and already extracted bundles, so whatever it returns must win.
+        var bundleService = new RecordingBundleService(extractedDcpDirectory.FullName);
+        var check = new DcpConnectionHealthCheck(
+            new FixedLayoutDiscovery(LayoutComponent.Dcp, discoveredDcpDirectory.FullName),
+            bundleService,
+            tester,
+            CreateExecutionContext(workspace),
+            NullLogger<DcpConnectionHealthCheck>.Instance);
+
+        await check.CheckAsync();
+
+        Assert.Equal(0, bundleService.EnsureExtractedAndAcquireLayoutCallCount);
+        Assert.All(probedPaths, path => Assert.Equal(discoveredDcpDirectory.FullName, path));
+        Assert.NotEmpty(probedPaths);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WhenStartIsCanceledBeforeProcessStarts_PropagatesCancellationAndDisposesExecution()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var dcpDirectory = CreateDcpDirectoryWithExecutable(workspace);
+        TestProcessExecution? execution = null;
+        var processExecutionFactory = new TestProcessExecutionFactory
+        {
+            CreateExecutionWithFileNameCallback = (fileName, args, env, _, options) =>
+            {
+                var testExecution = new TestProcessExecution(
+                    fileName,
+                    args,
+                    env,
+                    options,
+                    (_, _, _) => Task.FromResult((0, (string?)null)),
+                    () => 1)
+                {
+                    ThrowOnHasExitedBeforeStart = true
+                };
+
+                execution = testExecution;
+                return testExecution;
+            }
+        };
+        var checker = new DcpConnectionChecker(
+            CertificateManager.Create(NullLogger.Instance, new HostEnvironment(), nssDbOverride: null),
+            processExecutionFactory,
+            CreateExecutionContext(workspace),
+            new HostEnvironment(),
+            NullLogger<DcpConnectionChecker>.Instance);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => checker.TestConnectionAsync(dcpDirectory.FullName, useDeveloperCertificate: false, cancellation.Token));
+
+        Assert.NotNull(execution);
+        Assert.False(execution.Started);
+        Assert.Equal(0, execution.KillCount);
+        Assert.Equal(1, execution.DisposeCount);
     }
 
     [Fact]
@@ -73,6 +183,7 @@ public class DcpConnectionHealthCheckTests(ITestOutputHelper outputHelper)
         };
         var check = new DcpConnectionHealthCheck(
             new FixedLayoutDiscovery(LayoutComponent.Dcp, dcpDirectory.FullName),
+            new NullBundleService(),
             tester,
             CreateExecutionContext(workspace),
             NullLogger<DcpConnectionHealthCheck>.Instance);
@@ -102,6 +213,7 @@ public class DcpConnectionHealthCheckTests(ITestOutputHelper outputHelper)
         };
         var check = new DcpConnectionHealthCheck(
             new FixedLayoutDiscovery(LayoutComponent.Dcp, dcpDirectory.FullName),
+            new NullBundleService(),
             tester,
             CreateExecutionContext(workspace),
             NullLogger<DcpConnectionHealthCheck>.Instance);
@@ -180,7 +292,7 @@ public class DcpConnectionHealthCheckTests(ITestOutputHelper outputHelper)
 
         RemoteExecutor.Invoke(static homePath =>
         {
-            var certificateManager = CertificateManager.Create(NullLogger.Instance, new HostEnvironment());
+            var certificateManager = CertificateManager.Create(NullLogger.Instance, new HostEnvironment(), nssDbOverride: null);
             using var certificate = certificateManager.CreateAspNetCoreHttpsDevelopmentCertificate(
                 DateTimeOffset.UtcNow.AddDays(-1),
                 DateTimeOffset.UtcNow.AddDays(30));
@@ -200,9 +312,9 @@ public class DcpConnectionHealthCheckTests(ITestOutputHelper outputHelper)
         }, workspace.Path, options).Dispose();
     }
 
-    private static DirectoryInfo CreateDcpDirectoryWithExecutable(TemporaryWorkspace workspace)
+    private static DirectoryInfo CreateDcpDirectoryWithExecutable(TemporaryWorkspace workspace, string directoryName = "dcp")
     {
-        var dcpDirectory = workspace.WorkspaceRoot.CreateSubdirectory("dcp");
+        var dcpDirectory = workspace.WorkspaceRoot.CreateSubdirectory(directoryName);
         File.WriteAllText(BundleDiscovery.GetDcpExecutablePath(dcpDirectory.FullName), string.Empty);
 
         return dcpDirectory;

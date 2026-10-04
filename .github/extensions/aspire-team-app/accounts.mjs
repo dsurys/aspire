@@ -11,6 +11,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 
+import { coreTeamMemberAliasSuffixes } from "./constants.mjs";
+
 const execFileAsync = promisify(execFile);
 
 const API = "https://api.github.com";
@@ -18,8 +20,8 @@ const GRAPHQL = `${API}/graphql`;
 const UA = "aspire-team-app-canvas";
 
 // REST + GraphQL endpoints for a given host. github.com uses the public API
-// origin; GitHub Enterprise Server (GHES) exposes /api/v3 and /api/graphql on the
-// instance host itself.
+// origin; GHE.com data-residency hosts use an api.<host> origin; GitHub Enterprise
+// Server (GHES) exposes /api/v3 and /api/graphql on the instance host itself.
 function normalizeHost(host) {
   const h = String(host ?? "")
     .trim()
@@ -29,10 +31,13 @@ function normalizeHost(host) {
   return !h || h === "github.com" || h === "api.github.com" ? "github.com" : h;
 }
 
-function endpoints(host) {
+export function endpoints(host) {
   const h = normalizeHost(host);
   if (h === "github.com") {
     return { rest: "https://api.github.com", graphql: "https://api.github.com/graphql" };
+  }
+  if (h.endsWith(".ghe.com")) {
+    return { rest: `https://api.${h}`, graphql: `https://api.${h}/graphql` };
   }
   return { rest: `https://${h}/api/v3`, graphql: `https://${h}/api/graphql` };
 }
@@ -232,6 +237,56 @@ export function accountId(login, host) {
   const key = loginKey(login);
   const h = normalizeHost(host);
   return `acct:${h}/${key}`;
+}
+
+// Extract the login portion from an account id. Handles both the current
+// "acct:<host>/<login>" shape and the legacy github.com-only "acct:<login>" shape.
+function loginFromAccountId(id) {
+  const raw = String(id ?? "");
+  const withoutPrefix = raw.startsWith("acct:") ? raw.slice("acct:".length) : raw;
+  const slash = withoutPrefix.lastIndexOf("/");
+  return slash === -1 ? withoutPrefix : withoutPrefix.slice(slash + 1);
+}
+
+// Enterprise Managed User (EMU) accounts live on github.com like any other user,
+// but their login carries an org alias suffix (e.g. "dapine_microsoft"). This
+// classifies such logins by that suffix. The suffix list is the same one used for
+// core-team author attribution (constants.coreTeamMemberAliasSuffixes), keeping a
+// single source of truth for what an alias looks like.
+export function isEmuLogin(login) {
+  const normalized = String(login ?? "").trim().toLowerCase();
+  return coreTeamMemberAliasSuffixes.some((suffix) => {
+    const s = String(suffix).toLowerCase();
+    return s.length > 0 && normalized.endsWith(s) && normalized.length > s.length;
+  });
+}
+
+export function isEmuAccountId(id) {
+  // EMU aliases only exist on github.com (see isEmuLogin), so classification must honor the
+  // account's host. A host-scoped id ("acct:<host>/<login>") therefore has to name github.com
+  // to be treated as EMU — otherwise a GHES account whose login happens to end in an org-alias
+  // suffix (e.g. "acct:ghe.example.com/alice_microsoft") would be misclassified as EMU. Legacy
+  // hostless ids ("acct:<login>") predate host scoping and are github.com by definition, so
+  // they keep the login-only classification.
+  const host = hostFromAccountId(id);
+  if (host !== null && normalizeHost(host) !== "github.com") {
+    return false;
+  }
+  return isEmuLogin(loginFromAccountId(id));
+}
+
+export function isProximaAccountId(id) {
+  const host = hostFromAccountId(id);
+  return host !== null && normalizeHost(host) === "msft.ghe.com";
+}
+
+// Extract the host portion from a host-scoped account id ("acct:<host>/<login>"). Returns
+// null for the legacy hostless shape ("acct:<login>"), which callers treat as github.com.
+function hostFromAccountId(id) {
+  const raw = String(id ?? "");
+  const withoutPrefix = raw.startsWith("acct:") ? raw.slice("acct:".length) : raw;
+  const slash = withoutPrefix.lastIndexOf("/");
+  return slash === -1 ? null : withoutPrefix.slice(0, slash);
 }
 
 function score(probe) {

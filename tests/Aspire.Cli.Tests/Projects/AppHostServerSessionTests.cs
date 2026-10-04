@@ -17,6 +17,7 @@ using Aspire.Cli.Utils;
 using Aspire.Hosting;
 using Aspire.Shared;
 using Aspire.Tests;
+using Aspire.TestUtilities;
 using Microsoft.AspNetCore.InternalTesting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -46,6 +47,21 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
         Assert.NotNull(project.ReceivedEnvironmentVariables);
         Assert.Equal("present", project.ReceivedEnvironmentVariables["EXISTING_VALUE"]);
         Assert.Equal(session.AuthenticationToken, project.ReceivedEnvironmentVariables[KnownConfigNames.RemoteAppHostToken]);
+    }
+
+    [Fact]
+    public async Task Start_WithIsolatedConsole_RequestsKillOnParentExitForAppHostServer()
+    {
+        var project = new RecordingAppHostServerProject();
+
+        await using var session = CreateSession(
+            project,
+            CancellationToken.None,
+            isolateConsole: true);
+        await session.StartAsync();
+
+        Assert.True(project.ReceivedRunControl?.IsolateConsole);
+        Assert.True(project.ReceivedRunControl?.KillOnParentExit);
     }
 
     [Fact]
@@ -123,6 +139,7 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
     }
 
     [Fact]
+    [QuarantinedTest("https://github.com/microsoft/aspire/issues/19150")]
     public async Task GetRpcClientAsync_WhenServerExitsBeforeSocketIsAvailable_FailsWithoutWaitingForConnectionTimeout()
     {
         // RecordingAppHostServerProject spawns `dotnet --version`, which exits almost immediately
@@ -563,11 +580,8 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
     {
         var executionContext = TestExecutionContextFactory.CreateTestContext();
         var nugetService = new BundleNuGetService(
-            new NullLayoutDiscovery(),
-            new LayoutProcessRunner(new TestProcessExecutionFactory()),
-            new TestFeatures(),
-            new TestEnvironment(),
-            NullLogger<BundleNuGetService>.Instance);
+            NullLogger<BundleNuGetService>.Instance,
+            new FakeNuGetClient());
 
         return new AppHostServerProjectFactory(
             new TestDotNetCliRunner(),
@@ -587,6 +601,8 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
 
         public Dictionary<string, string>? ReceivedEnvironmentVariables { get; private set; }
 
+        public AppHostServerRunControl? ReceivedRunControl { get; private set; }
+
         public IProcessExecution? StartedExecution { get; private set; }
 
         public string GetInstanceIdentifier() => AppDirectoryPath;
@@ -599,7 +615,7 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
-        public Task<AppHostServerRunResult> RunAsync(
+        public async Task<AppHostServerRunResult> RunAsync(
             int hostPid,
             IReadOnlyDictionary<string, string>? environmentVariables = null,
             string[]? additionalArgs = null,
@@ -609,6 +625,7 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
             ReceivedEnvironmentVariables = environmentVariables is null
                 ? null
                 : new Dictionary<string, string>(environmentVariables);
+            ReceivedRunControl = runControl;
 
             var startInfo = new ProcessStartInfo("dotnet")
             {
@@ -619,13 +636,13 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
             startInfo.ArgumentList.Add("--version");
 
             var execution = CreateServerExecution(startInfo, runControl);
-            execution.Start();
+            await execution.StartAsync(CancellationToken.None);
 
             StartedExecution = execution;
-            return Task.FromResult(new AppHostServerRunResult(
+            return new AppHostServerRunResult(
                 SocketPath: "test.sock",
                 OutputCollector: new OutputCollector(),
-                Execution: execution));
+                Execution: execution);
         }
     }
 
@@ -643,7 +660,7 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
-        public Task<AppHostServerRunResult> RunAsync(
+        public async Task<AppHostServerRunResult> RunAsync(
             int hostPid,
             IReadOnlyDictionary<string, string>? environmentVariables = null,
             string[]? additionalArgs = null,
@@ -651,9 +668,11 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
             AppHostServerRunControl? runControl = null)
         {
             // Use a cross-platform long-running command so the test exercises the kill path
-            // rather than a quickly-exiting probe like `dotnet --version`.
+            // rather than a quickly-exiting probe like `dotnet --version`. Avoid stdin-driven
+            // commands such as `cmd /c pause`: ProcessExecution gives children an EOF stdin, so
+            // they exit within milliseconds and the "still running" assertions race under load.
             var (fileName, arguments) = OperatingSystem.IsWindows()
-                ? ("cmd.exe", new[] { "/c", "pause" })
+                ? ("ping.exe", new[] { "-n", "61", "127.0.0.1" })
                 : ("sleep", new[] { "60" });
 
             var startInfo = new ProcessStartInfo(fileName)
@@ -668,12 +687,12 @@ public class AppHostServerSessionTests(ITestOutputHelper outputHelper)
             }
 
             var execution = CreateServerExecution(startInfo, runControl);
-            execution.Start();
+            await execution.StartAsync(CancellationToken.None);
 
-            return Task.FromResult(new AppHostServerRunResult(
+            return new AppHostServerRunResult(
                 SocketPath: "test.sock",
                 OutputCollector: new OutputCollector(),
-                Execution: execution));
+                Execution: execution);
         }
     }
 

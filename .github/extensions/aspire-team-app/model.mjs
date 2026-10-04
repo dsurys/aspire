@@ -16,6 +16,7 @@ import {
   nonBlockingCheckFailureRules,
   personalPickActions,
   releaseBlockingLabelMarker,
+  reviewDebtSignalLabel,
 } from "./constants.mjs";
 
 const approvedAgingMs = 2 * dayMs;
@@ -125,12 +126,15 @@ function isCommunityAuthor(author, authorType) {
 export function isCommunityPullRequest(pr) {
   return !pr.isMine && !pr.repoPrivate && isCommunityAuthor(pr.author, pr.authorType) && !isCommunityToolkitPullRequest(pr);
 }
+export function reviewAgeStartedAt(pr) {
+  return pr.readyForReviewAt ?? pr.createdAt;
+}
 export function isAgedOutCommunityPullRequest(pr) {
   return isCommunityPullRequest(pr) && ageMs(pr.updatedAt) > focusAgeLimitMs;
 }
 function isCommunityWaiting(pr) {
   return !pr.isMine && !pr.repoPrivate && isCommunityAuthor(pr.author, pr.authorType) && (
-    (pr.review.state === "waiting" && ageMs(pr.createdAt) >= communityWaitMs) ||
+    (pr.review.state === "waiting" && ageMs(reviewAgeStartedAt(pr)) >= communityWaitMs) ||
     (pr.review.state === "reviewed" && isIdle(pr))
   );
 }
@@ -356,7 +360,7 @@ function reviewSignal(pr, bucketLabel) {
     case "Docs": return "generated docs";
     case "Community Toolkit": return "CommunityToolkit/Aspire";
     case "Bots / automation": return "bot";
-    case "Community": return isCommunityWaiting(pr) ? `Community · waiting ${formatAge(pr.createdAt)}` : "community";
+    case "Community": return isCommunityWaiting(pr) ? `Community · waiting ${formatAge(reviewAgeStartedAt(pr))}` : "community";
     case agedOutCommunityBucketLabel: return agedOutCommunityBucketLabel;
     case "Quick wins": return reviewFootprint(pr);
     case "Needs review": return "No reviews";
@@ -464,9 +468,10 @@ export function createAttentionSignals(item) {
     signals.push(ageSignal);
   }
 
+  const reviewAgeAt = reviewAgeStartedAt(pullRequest);
   signals.push({
-    label: `open ${formatAge(pullRequest.createdAt)}`,
-    tone: Date.now() - new Date(pullRequest.createdAt).getTime() >= 7 * dayMs ? "warning" : "muted",
+    label: `open ${formatAge(reviewAgeAt)}`,
+    tone: ageMs(reviewAgeAt) >= 7 * dayMs ? "warning" : "muted",
   });
 
   if (progress && !prioritizeProgress) {
@@ -486,7 +491,11 @@ export function createAttentionSignals(item) {
     : pullRequest.labels;
 
   for (const label of computedLabels.slice(0, 2)) {
-    signals.push({ label, tone: "accent" });
+    // Tag raw GitHub labels with a kind so downstream action derivation (render.mjs signalActions /
+    // isReviewDebtItem) can tell user-controlled label text apart from app-computed semantic signals.
+    // Without this a repo label literally named "merge conflicts", "re-review", or "3 unresolved"
+    // would match those action regexes and expose a destructive action the PR's real state lacks.
+    signals.push({ label, tone: "accent", kind: "repo-label" });
   }
 
   if (isBotAuthor(pullRequest.author, pullRequest.authorType)) {
@@ -528,8 +537,10 @@ function checksAttentionSignal(pullRequest) {
 
 function oldFirstSignal(pullRequest) {
   const activityAge = ageMs(pullRequestAgingReferenceAt(pullRequest));
-  if (activityAge >= focusAgeLimitMs) {
-    return { label: "review debt", tone: "danger" };
+  // Route through isReviewDebt so the emitted signal and the focus-retention predicate share one
+  // definition (notably its approved-PR exclusion) and cannot drift.
+  if (isReviewDebt(pullRequest)) {
+    return { label: reviewDebtSignalLabel, tone: "danger" };
   }
   if (activityAge >= 7 * dayMs) {
     return { label: "old first", tone: "warning" };
@@ -713,6 +724,14 @@ function pullRequestFocusActivityAt(pr, bucketLabel) {
 function isWithinFocusAgeLimit(pr, bucketLabel) {
   return ageMs(pullRequestFocusActivityAt(pr, bucketLabel)) <= focusAgeLimitMs;
 }
+// A PR is in "review debt" once it has aged past the focus limit without yet earning an
+// approving review. oldFirstSignal() calls this directly so the "review debt" signal and this
+// retention predicate can never drift. Approved PRs are excluded: they have already been
+// reviewed and carry a merge-oriented lane ("Approved but aging" -> "land approval"), so
+// flagging them "review debt" / "Address review" would mislabel the action.
+export function isReviewDebt(pr) {
+  return pr.review.state !== "approved" && ageMs(pullRequestAgingReferenceAt(pr)) >= focusAgeLimitMs;
+}
 
 const excludedFocusBucketLabels = new Set(["Stalled", "Draft", "My draft PRs", "Docs", "Community Toolkit", "Bots / automation", "Community", "Aged out community", "Unresolved feedback", "Merge conflicts", "CI failing", "Author response"]);
 const disqualifyingFocusBucketLabels = new Set(["Draft", "My draft PRs", "Docs", "Community Toolkit", "Bots / automation", "Community", "Aged out community", "Unresolved feedback", "Merge conflicts"]);
@@ -724,8 +743,25 @@ const focusBucketRanks = new Map([
 function focusBucketRank(label) {
   return focusBucketRanks.has(label) ? focusBucketRanks.get(label) : Number.MAX_SAFE_INTEGER;
 }
+// The same owner/repo slug and PR number can exist on github.com and a GHES/EMU host at once (the
+// loader aggregates accounts across hosts, which is why github.mjs keys repo success/errors per
+// host too). Derive the host from the canonical PR url so the focus identity distinguishes them;
+// without it byPr would collapse two different PRs into one card and a disqualifying bucket on one
+// host would block the other host's PR. Fall back to "" when the url is absent or unparseable so
+// github.com-only data (and fixtures without a url) key exactly as before.
+function prHost(pr) {
+  const url = pr && pr.url;
+  if (typeof url !== "string" || url === "") {
+    return "";
+  }
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+}
 function prKey(pr) {
-  return `${pr.repository.toLowerCase()}#${pr.number}`;
+  return `${prHost(pr)}\n${pr.repository.toLowerCase()}#${pr.number}`;
 }
 
 export function computeFocusItems(buckets) {
@@ -740,8 +776,16 @@ export function computeFocusItems(buckets) {
     if (isWaitingOnAuthor(labels)) blocked.add(key);
   }
   const flat = buckets
-    .filter((b) => !excludedFocusBucketLabels.has(b.label))
-    .flatMap((b) => b.items.map((i) => ({ ...i, bucketLabel: b.label, bucketTone: b.tone })));
+    // "Stalled" is normally excluded so idle PRs don't flood focus, but a review-debt PR whose
+    // ONLY lane is "Stalled" (e.g. reviewed-then-gone-quiet, so no "Needs review"/actionable
+    // bucket) would never reach the retention filter below and the "Address review" action would
+    // be unreachable — the exact case oldFirstSignal() still flags. Let those single Stalled
+    // items through; the isReviewDebt gate keeps 7–14d stalled PRs out, and the age/community/CI
+    // filters below still apply. Non-Stalled excluded buckets stay fully excluded.
+    .filter((b) => !excludedFocusBucketLabels.has(b.label) || b.label === "Stalled")
+    .flatMap((b) => b.items
+      .filter((i) => b.label !== "Stalled" || isReviewDebt(i.pullRequest))
+      .map((i) => ({ ...i, bucketLabel: b.label, bucketTone: b.tone })));
 
   const byPr = new Map();
   for (const item of flat) {
@@ -753,7 +797,13 @@ export function computeFocusItems(buckets) {
     }
   }
   return [...byPr.values()]
-    .filter((i) => isWithinFocusAgeLimit(i.pullRequest, i.bucketLabel))
+    // Retain PRs within the focus window, plus review-debt PRs that have aged PAST the limit
+    // without an approving review. Those are exactly the cards the "review debt" signal / "Address review"
+    // action target (constants.mjs reviewDebtSignalLabel). Dropping them here previously made
+    // that action unreachable: the signal only fires at/after the same age boundary this filter
+    // cut them off at, so the two overlapped only at the exact 14-day instant. Keeping them
+    // makes the focus source set consistent with the signal that flags it.
+    .filter((i) => isWithinFocusAgeLimit(i.pullRequest, i.bucketLabel) || isReviewDebt(i.pullRequest))
     .filter((i) => !isCommunityPullRequest(i.pullRequest))
     .filter((i) => !isChecksFailing(i.pullRequest))
     .sort((a, b) => new Date(b.pullRequest.updatedAt) - new Date(a.pullRequest.updatedAt));
@@ -873,12 +923,12 @@ function pickScore(item) {
   if (st === "reviewed") score += 25;
   if (st === "approved") score += 5;
   if (isBotAuthor(item.pullRequest.author, item.pullRequest.authorType)) score -= 120;
-  return score + Math.min(3, Math.floor(ageMs(item.pullRequest.createdAt) / dayMs)) +
+  return score + Math.min(3, Math.floor(ageMs(reviewAgeStartedAt(item.pullRequest)) / dayMs)) +
     Math.min(1, Math.floor(ageMs(item.pullRequest.updatedAt) / dayMs));
 }
 
 function pickReason(pr) {
-  const signals = [`open ${formatAge(pr.createdAt)}`];
+  const signals = [`open ${formatAge(reviewAgeStartedAt(pr))}`];
   if (pr.review.approvalCount > 0) signals.push(formatCount(pr.review.approvalCount, "approval"));
   else if (pr.review.reviewerCount > 0) signals.push(`${formatCount(pr.review.reviewerCount, "reviewer")} · 0 approvals`);
   else signals.push("no reviews");

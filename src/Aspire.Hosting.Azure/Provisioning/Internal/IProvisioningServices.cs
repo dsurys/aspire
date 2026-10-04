@@ -8,9 +8,10 @@ using Azure.Core;
 using Azure.ResourceManager;
 using Azure.ResourceManager.Authorization;
 using Azure.ResourceManager.Authorization.Models;
-using Azure.ResourceManager.Resources;
-using Azure.ResourceManager.Resources.Models;
+using Azure.ResourceManager.Resources.Deployments;
+using Azure.ResourceManager.Resources.Deployments.Models;
 using Azure.Security.KeyVault.Secrets;
+using ResourceGroupData = Azure.ResourceManager.Resources.ResourceGroupData;
 
 namespace Aspire.Hosting.Azure.Provisioning.Internal;
 
@@ -368,12 +369,12 @@ internal interface ITenantResource
 }
 
 /// <summary>
-/// Provides user principal retrieval functionality.
+/// Provides Azure principal retrieval functionality.
 /// </summary>
-internal interface IUserPrincipalProvider
+internal interface IAzurePrincipalProvider
 {
     /// <summary>
-    /// Gets the user principal.
+    /// Gets the Azure principal that the running credential represents.
     /// </summary>
-    Task<UserPrincipal> GetUserPrincipalAsync(CancellationToken cancellationToken = default);
+    Task<AzurePrincipal> GetPrincipalAsync(CancellationToken cancellationToken = default);
 }

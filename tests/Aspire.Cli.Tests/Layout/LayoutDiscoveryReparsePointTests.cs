@@ -3,6 +3,7 @@
 
 using Aspire.Cli.Layout;
 using Aspire.Cli.Tests.Acquisition;
+using Aspire.Cli.Tests.Utils;
 using Aspire.Cli.Utils;
 using Aspire.Shared;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -95,12 +96,17 @@ public class LayoutDiscoveryReparsePointTests(ITestOutputHelper outputHelper)
 
         var versionsDir = Path.Combine(layoutRoot, "versions", "v1");
         var versionedManaged = Path.Combine(versionsDir, BundleDiscovery.ManagedDirectoryName);
+        var versionedDashboard = Path.Combine(versionsDir, BundleDiscovery.DashboardDirectoryName);
         var versionedDcp = Path.Combine(versionsDir, BundleDiscovery.DcpDirectoryName);
         Directory.CreateDirectory(versionedManaged);
+        Directory.CreateDirectory(versionedDashboard);
         Directory.CreateDirectory(versionedDcp);
         File.WriteAllText(
             Path.Combine(versionedManaged, BundleDiscovery.GetExecutableFileName(BundleDiscovery.ManagedExecutableName)),
             "stub");
+        var dashboardPath = Path.Combine(versionedDashboard, BundleDiscovery.GetExecutableFileName(BundleDiscovery.DashboardExecutableName));
+        File.WriteAllText(dashboardPath, "stub");
+        File.WriteAllText(BundleDiscovery.GetDcpExecutablePath(versionedDcp), "stub");
 
         // Create a single bundle/ link pointing at the versioned directory.
         var bundleLink = Path.Combine(layoutRoot, BundleDiscovery.BundleDirectoryName);
@@ -117,6 +123,9 @@ public class LayoutDiscoveryReparsePointTests(ITestOutputHelper outputHelper)
 
             Assert.NotNull(layout);
             Assert.Equal(layoutRoot, layout!.LayoutPath);
+            Assert.Equal(
+                Path.Combine(bundleLink, BundleDiscovery.DashboardDirectoryName, BundleDiscovery.GetExecutableFileName(BundleDiscovery.DashboardExecutableName)),
+                layout.GetDashboardPath());
             Assert.True(discovery.IsBundleModeAvailable());
         }
         finally
@@ -210,15 +219,100 @@ public class LayoutDiscoveryReparsePointTests(ITestOutputHelper outputHelper)
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DiscoverLayout_RejectsRelativeLayoutWithoutDcpExecutable(bool useBundleDirectory)
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var layoutRoot = workspace.WorkspaceRoot.FullName;
+        var componentRoot = useBundleDirectory
+            ? Path.Combine(layoutRoot, BundleDiscovery.BundleDirectoryName)
+            : layoutRoot;
+        var managedDir = Directory.CreateDirectory(Path.Combine(componentRoot, BundleDiscovery.ManagedDirectoryName));
+        Directory.CreateDirectory(Path.Combine(componentRoot, BundleDiscovery.DcpDirectoryName));
+        File.WriteAllText(
+            Path.Combine(managedDir.FullName, BundleDiscovery.GetExecutableFileName(BundleDiscovery.ManagedExecutableName)),
+            "stub");
+        var dashboardDir = Directory.CreateDirectory(Path.Combine(componentRoot, BundleDiscovery.DashboardDirectoryName));
+        File.WriteAllText(
+            Path.Combine(dashboardDir.FullName, BundleDiscovery.GetExecutableFileName(BundleDiscovery.DashboardExecutableName)),
+            "stub");
+        var binaryPath = Path.Combine(layoutRoot, OperatingSystem.IsWindows() ? "aspire.exe" : "aspire");
+        File.WriteAllText(binaryPath, "stub");
+
+        var discovery = new LayoutDiscovery(NullLogger<LayoutDiscovery>.Instance, new TestEnvironment())
+        {
+            ProcessPathOverride = binaryPath
+        };
+
+        var layout = discovery.DiscoverLayout();
+
+        Assert.NotEqual(layoutRoot, layout?.LayoutPath);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void DiscoverLayout_RequiresSeparateDashboard(bool useBundleDirectory, bool legacyDashboardExists)
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var layoutRoot = workspace.WorkspaceRoot.FullName;
+        var componentRoot = useBundleDirectory
+            ? Path.Combine(layoutRoot, BundleDiscovery.BundleDirectoryName)
+            : layoutRoot;
+        var managedDir = Directory.CreateDirectory(Path.Combine(componentRoot, BundleDiscovery.ManagedDirectoryName));
+        var dcpDir = Directory.CreateDirectory(Path.Combine(componentRoot, BundleDiscovery.DcpDirectoryName));
+        File.WriteAllText(
+            Path.Combine(managedDir.FullName, BundleDiscovery.GetExecutableFileName(BundleDiscovery.ManagedExecutableName)),
+            "stub");
+        File.WriteAllText(BundleDiscovery.GetDcpExecutablePath(dcpDir.FullName), "stub");
+        if (legacyDashboardExists)
+        {
+            File.WriteAllText(
+                Path.Combine(managedDir.FullName, BundleDiscovery.GetExecutableFileName(BundleDiscovery.DashboardExecutableName)),
+                "stub");
+        }
+
+        var binaryPath = Path.Combine(layoutRoot, OperatingSystem.IsWindows() ? "aspire.exe" : "aspire");
+        File.WriteAllText(binaryPath, "stub");
+        var discovery = new LayoutDiscovery(NullLogger<LayoutDiscovery>.Instance, new TestEnvironment())
+        {
+            ProcessPathOverride = binaryPath
+        };
+
+        Assert.NotEqual(layoutRoot, discovery.DiscoverLayout()?.LayoutPath);
+
+        var dashboardDir = Directory.CreateDirectory(Path.Combine(componentRoot, BundleDiscovery.DashboardDirectoryName));
+        Assert.NotEqual(layoutRoot, discovery.DiscoverLayout()?.LayoutPath);
+
+        var dashboardPath = Path.Combine(dashboardDir.FullName, BundleDiscovery.GetExecutableFileName(BundleDiscovery.DashboardExecutableName));
+        File.WriteAllText(dashboardPath, "stub");
+
+        var layout = discovery.DiscoverLayout();
+        Assert.NotNull(layout);
+        Assert.Equal(layoutRoot, layout.LayoutPath);
+        Assert.Equal(dashboardPath, layout.GetDashboardPath());
+        Assert.True(discovery.IsBundleModeAvailable());
+    }
+
     private static void CreateValidBundleLayout(string layoutRoot)
     {
         var bundleDir = Path.Combine(layoutRoot, BundleDiscovery.BundleDirectoryName);
         var managedDir = Path.Combine(bundleDir, BundleDiscovery.ManagedDirectoryName);
+        var dashboardDir = Path.Combine(bundleDir, BundleDiscovery.DashboardDirectoryName);
         var dcpDir = Path.Combine(bundleDir, BundleDiscovery.DcpDirectoryName);
         Directory.CreateDirectory(managedDir);
+        Directory.CreateDirectory(dashboardDir);
         Directory.CreateDirectory(dcpDir);
         File.WriteAllText(
             Path.Combine(managedDir, BundleDiscovery.GetExecutableFileName(BundleDiscovery.ManagedExecutableName)),
             "stub");
+        File.WriteAllText(
+            Path.Combine(dashboardDir, BundleDiscovery.GetExecutableFileName(BundleDiscovery.DashboardExecutableName)),
+            "stub");
+        File.WriteAllText(BundleDiscovery.GetDcpExecutablePath(dcpDir), "stub");
     }
 }

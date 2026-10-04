@@ -382,7 +382,7 @@ public class DotNetTemplateFactoryTests
         public Task<string> PromptForStringAsync(string promptText, Func<string, ValidationResult>? validator = null, bool isSecret = false, bool required = false, PromptBinding<string?>? binding = null, CancellationToken cancellationToken = default)
             => throw new NotImplementedException();
 
-        public Task<string> PromptForFilePathAsync(string promptText, Func<string, ValidationResult>? validator = null, bool directory = false, bool required = false, PromptBinding<string?>? binding = null, CancellationToken cancellationToken = default)
+        public Task<string> PromptForFilePathAsync(string promptText, Func<string, ValidationResult>? validator = null, bool directory = false, bool required = false, PromptBinding<string?>? binding = null, bool retryOnValidationFailure = false, CancellationToken cancellationToken = default)
             => throw new NotImplementedException();
 
         public Task<bool> PromptConfirmAsync(string prompt, PromptBinding<bool>? binding = null, CancellationToken cancellationToken = default)
@@ -404,7 +404,7 @@ public class DotNetTemplateFactoryTests
         public void DisplayError(string message, bool allowMarkup = false) { }
         public void DisplayMessage(KnownEmoji emoji, string message, bool allowMarkup = false, ConsoleOutput? consoleOverride = null) { }
         public void DisplayLines(IEnumerable<(OutputLineStream Stream, string Line)> lines) { }
-        public void DisplayCancellationMessage(ConsoleOutput? consoleOverride = null) { }
+        public void DisplayCancellationMessage(string? message = null, ConsoleOutput? consoleOverride = null) { }
         public int DisplayIncompatibleVersionError(AppHostIncompatibleException ex, string appHostHostingVersion) => 0;
         public void DisplayPlainText(string text) { }
         public void DisplayRawText(string text, ConsoleOutput? consoleOverride = null) { }
@@ -430,6 +430,9 @@ public class DotNetTemplateFactoryTests
             => throw new NotImplementedException();
 
         public Task<int> BuildAsync(FileInfo projectFile, bool noRestore, ProcessInvocationOptions options, CancellationToken cancellationToken)
+            => throw new NotImplementedException();
+
+        public Task<int> BuildAsync(FileInfo projectFile, bool noRestore, IDictionary<string, string>? env, ProcessInvocationOptions options, CancellationToken cancellationToken)
             => throw new NotImplementedException();
 
         public Task<int> AddPackageAsync(FileInfo projectFile, string packageName, string version, string? packageSourceUrl, bool noRestore, ProcessInvocationOptions options, CancellationToken cancellationToken)
@@ -474,6 +477,8 @@ public class DotNetTemplateFactoryTests
                 EnvironmentVariables = new Dictionary<string, string>(),
                 Success = true
             });
+
+        public string? ExportDevCertificatePem(CancellationToken cancellationToken) => null;
     }
 
     private sealed class TestNewCommandPrompter : INewCommandPrompter, ITemplateVersionPrompter

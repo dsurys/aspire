@@ -27,7 +27,7 @@ internal interface IAppHostCliBackchannel
     Task CompletePromptResponseAsync(string promptId, PublishingPromptInputAnswer[] answers, CancellationToken cancellationToken);
     Task UpdatePromptResponseAsync(string promptId, PublishingPromptInputAnswer[] answers, CancellationToken cancellationToken);
     Task<GetPipelineStepsResponse> GetPipelineStepsAsync(string? step, CancellationToken cancellationToken);
-    Task<UploadFileResponse> UploadFileAsync(string filePath, string fileName, CancellationToken cancellationToken);
+    Task<UploadFileResponse> UploadFileAsync(string filePath, string fileName, int interactionId, string inputName, CancellationToken cancellationToken);
 }
 
 internal sealed class AppHostCliBackchannel(
@@ -168,7 +168,7 @@ internal sealed class AppHostCliBackchannel(
 
                 logger.LogDebug("Received {OperationName} async enumerable", operationName);
             }
-            catch (Exception ex) when (_autoReconnect && !cancellationToken.IsCancellationRequested && IsConnectionLostException(ex))
+            catch (Exception ex) when (_autoReconnect && !cancellationToken.IsCancellationRequested && BackchannelDisconnectHelpers.IsExpectedDisconnect(ex))
             {
                 logger.LogDebug("Connection lost while getting {OperationName}, waiting for reconnect...", operationName);
                 await WaitForReconnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -218,7 +218,7 @@ internal sealed class AppHostCliBackchannel(
                     }
                     current = enumerator.Current;
                 }
-                catch (Exception ex) when (_autoReconnect && !cancellationToken.IsCancellationRequested && IsConnectionLostException(ex))
+                catch (Exception ex) when (_autoReconnect && !cancellationToken.IsCancellationRequested && BackchannelDisconnectHelpers.IsExpectedDisconnect(ex))
                 {
                     source.RetryBecauseConnectionLost = true;
 
@@ -236,18 +236,11 @@ internal sealed class AppHostCliBackchannel(
             {
                 await enumerator.DisposeAsync().ConfigureAwait(false);
             }
-            catch (Exception ex) when (IsConnectionLostException(ex))
+            catch (Exception ex) when (BackchannelDisconnectHelpers.IsExpectedDisconnect(ex))
             {
                 logger.LogDebug("Ignoring connection lost exception during enumerator disposal");
             }
         }
-    }
-
-    private static bool IsConnectionLostException(Exception ex)
-    {
-        return ex is ConnectionLostException
-            || ex is ObjectDisposedException
-            || (ex is OperationCanceledException && ex.InnerException is ConnectionLostException);
     }
 
     private async Task WaitForReconnectionAsync(CancellationToken cancellationToken)
@@ -554,7 +547,7 @@ internal sealed class AppHostCliBackchannel(
         return response;
     }
 
-    public async Task<UploadFileResponse> UploadFileAsync(string filePath, string fileName, CancellationToken cancellationToken)
+    public async Task<UploadFileResponse> UploadFileAsync(string filePath, string fileName, int interactionId, string inputName, CancellationToken cancellationToken)
     {
         using var activity = telemetry.StartDiagnosticActivity();
 
@@ -585,7 +578,7 @@ internal sealed class AppHostCliBackchannel(
             profilingTelemetry,
             "apphost",
             "UploadFileAsync",
-            [new UploadFileRequest { Data = data, FileName = fileName }],
+            [new UploadFileRequest { Data = data, FileName = fileName, InteractionId = interactionId, InputName = inputName }],
             cancellationToken).ConfigureAwait(false);
 
         logger.LogDebug("File uploaded with ID {FileId}", response.FileId);

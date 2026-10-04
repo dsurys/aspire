@@ -38,6 +38,7 @@ internal interface IDotNetCliRunner
     Task<int> NewProjectAsync(string templateName, string name, string outputPath, string[] extraArgs, ProcessInvocationOptions options, CancellationToken cancellationToken);
     Task<int> RestoreAsync(FileInfo projectFilePath, ProcessInvocationOptions options, CancellationToken cancellationToken);
     Task<int> BuildAsync(FileInfo projectFilePath, bool noRestore, ProcessInvocationOptions options, CancellationToken cancellationToken);
+    Task<int> BuildAsync(FileInfo projectFilePath, bool noRestore, IDictionary<string, string>? env, ProcessInvocationOptions options, CancellationToken cancellationToken);
     Task<int> AddPackageAsync(FileInfo projectFilePath, string packageName, string packageVersion, string? nugetSource, bool noRestore, ProcessInvocationOptions options, CancellationToken cancellationToken);
     Task<int> AddProjectToSolutionAsync(FileInfo solutionFile, FileInfo projectFile, ProcessInvocationOptions options, CancellationToken cancellationToken);
     Task<(int ExitCode, NuGetPackage[]? Packages)> SearchPackagesAsync(DirectoryInfo workingDirectory, string query, bool exactMatch, bool prerelease, int take, int skip, FileInfo? nugetConfigFile, bool useCache, ProcessInvocationOptions options, CancellationToken cancellationToken);
@@ -53,6 +54,7 @@ internal sealed class ProcessInvocationOptions
     public Action<string>? StandardErrorCallback { get; set; }
 
     public bool NoLaunchProfile { get; set; }
+    public string? LaunchProfile { get; set; }
     public bool StartDebugSession { get; set; }
     public bool Debug { get; set; }
 
@@ -70,14 +72,12 @@ internal sealed class ProcessInvocationOptions
     /// <summary>
     /// When <c>true</c>, the spawned process is given its own hidden console group (Windows) so the
     /// shutdown ladder in <see cref="ProcessExecution"/> can target the child with DCP's
-    /// <c>stop-process-tree</c> CTRL+C dance without also signalling the CLI. On Windows a
-    /// console-isolated child is additionally bound to the process-wide
-    /// <see cref="WindowsConsoleProcessJob"/> kill-on-close job as its crash-time safety net.
+    /// <c>stop-process-tree</c> CTRL+C dance without also signalling the CLI.
     /// </summary>
     /// <remarks>
     /// Pair with <see cref="GracefulShutdownSignaler"/> and <see cref="ShutdownService"/> for
-    /// graceful shutdown. A non-isolated background helper that should not outlive the CLI can opt
-    /// into the same kill-on-close job — without a new console group — via <see cref="KillOnParentExit"/>.
+    /// graceful shutdown. Pair with <see cref="KillOnParentExit"/> when the child should also be
+    /// bound to the Windows kill-on-close job as a crash-time safety net.
     /// Leaving the signaler/service unset means cancellation falls back to
     /// <see cref="ProcessExecution"/>'s force-kill mode, preserving back-compat
     /// for the many non-Run callers (build, restore, package add, layout, etc.).
@@ -88,8 +88,8 @@ internal sealed class ProcessInvocationOptions
     /// When <c>true</c>, the child is bound to the CLI's Windows kill-on-close job so the OS terminates
     /// it when the CLI exits unexpectedly (crash / SIGKILL), even if the child does not react 
     /// to cancellation request. This is an OS-level, Windows-only crash-time safety net
-    /// for background helpers that must never outlive their parent — the <c>aspire-managed</c> NuGet
-    /// helper, the standalone dashboard, and the profiling collector — and, unlike
+    /// for background helpers that must never outlive their parent — such as the standalone dashboard
+    /// and profiling collector — and, unlike
     /// <see cref="IsolateConsole"/>, it does not give the child a new console group.
     /// </summary>
     /// <remarks>
@@ -99,6 +99,33 @@ internal sealed class ProcessInvocationOptions
     /// guaranteed backstop on Windows, and the watchdog is the graceful, cross-platform mechanism.
     /// </remarks>
     public bool KillOnParentExit { get; set; }
+
+    /// <summary>
+    /// When <c>true</c>, the process is launched as a detached child that survives the launching CLI.
+    /// Standard streams are connected to the null device and inherited handles are not passed to it.
+    /// </summary>
+    /// <remarks>
+    /// On Unix the child starts in a new session (<see cref="System.Diagnostics.ProcessStartInfo.StartDetached"/>).
+    /// On Windows it keeps a console (hidden when <see cref="IsolateConsole"/> is set) so it can still receive CTRL+C.
+    /// </remarks>
+    public bool Detached { get; set; }
+
+    /// <summary>
+    /// Optional predicate for inherited environment variable names that should be removed before applying caller-supplied variables.
+    /// </summary>
+    public Func<string, bool>? EnvironmentVariableFilter { get; set; }
+
+    /// <summary>
+    /// Index of the first argument that is user-supplied AppHost input rather than a CLI-owned
+    /// option, for invocations whose argument list has no <c>--</c> separator to key off. Leave
+    /// <see langword="null"/> when the separator is present or the whole list is CLI-owned.
+    /// </summary>
+    /// <remarks>
+    /// Launching a built AppHost directly (rather than through <c>dotnet run</c>) appends the
+    /// forwarded arguments straight onto the executable's command line, so the redaction boundary
+    /// has to travel with the invocation instead of being recovered from the arguments.
+    /// </remarks>
+    internal int? AppHostArgumentStartIndex { get; set; }
 
     /// <summary>
     /// Issues the graceful shutdown signal during the shutdown ladder (DCP
@@ -116,6 +143,11 @@ internal sealed class ProcessInvocationOptions
     public IGracefulShutdownWindow? ShutdownService { get; set; }
 
     /// <summary>
+    /// Invoked after an extension-owned AppHost launch, including any build performed by the extension.
+    /// </summary>
+    public Func<Task>? ExtensionAppHostLaunchCompletedAsync { get; set; }
+
+    /// <summary>
     /// Creates a shallow copy so a caller-supplied instance can be layered with additional settings
     /// without mutating the original, which the caller may reuse across invocations. The delegate and
     /// service references are intentionally shared with the copy.
@@ -125,14 +157,19 @@ internal sealed class ProcessInvocationOptions
         StandardOutputCallback = StandardOutputCallback,
         StandardErrorCallback = StandardErrorCallback,
         NoLaunchProfile = NoLaunchProfile,
+        LaunchProfile = LaunchProfile,
         StartDebugSession = StartDebugSession,
         Debug = Debug,
         SuppressLogging = SuppressLogging,
         KillEntireProcessTreeOnCancel = KillEntireProcessTreeOnCancel,
         IsolateConsole = IsolateConsole,
         KillOnParentExit = KillOnParentExit,
+        Detached = Detached,
+        EnvironmentVariableFilter = EnvironmentVariableFilter,
+        AppHostArgumentStartIndex = AppHostArgumentStartIndex,
         GracefulShutdownSignaler = GracefulShutdownSignaler,
         ShutdownService = ShutdownService,
+        ExtensionAppHostLaunchCompletedAsync = ExtensionAppHostLaunchCompletedAsync,
     };
 }
 
@@ -208,6 +245,7 @@ internal sealed class DotNetCliRunner(
         processActivity.SetDotNetResolvedExecutable(
             processFileName,
             effectiveArgs,
+            options.AppHostArgumentStartIndex,
             finalEnv.TryGetValue("DOTNET_CLI_USE_MSBUILD_SERVER", out var msBuildServerValue) ? msBuildServerValue : null);
         processActivity.SetDotNetArgsCount(effectiveArgs.Length);
 
@@ -240,6 +278,11 @@ internal sealed class DotNetCliRunner(
                     execution.EnvironmentVariables.Select(kvp => new EnvVar { Name = kvp.Key, Value = kvp.Value }).ToList(),
                     options.StartDebugSession);
 
+                if (options.ExtensionAppHostLaunchCompletedAsync is not null)
+                {
+                    await options.ExtensionAppHostLaunchCompletedAsync().ConfigureAwait(false);
+                }
+
                 await StartBackchannelAsync(null, socketPath!, backchannelCompletionSource, backchannelParentContext, cancellationToken).ConfigureAwait(false);
                 var backchannel = await backchannelCompletionSource.Task.ConfigureAwait(false);
 
@@ -253,7 +296,7 @@ internal sealed class DotNetCliRunner(
             }
         }
 
-        var started = execution.Start();
+        var started = await execution.StartAsync(cancellationToken).ConfigureAwait(false);
         processActivity.AddDotNetProcessStartResult(started, started ? execution.ProcessId : null);
 
         if (!started)
@@ -360,6 +403,11 @@ internal sealed class DotNetCliRunner(
             // and intentionally keep the force-kill path.
             IsolateConsole = options.IsolateConsole,
             KillOnParentExit = options.KillOnParentExit,
+            Detached = options.Detached,
+            EnvironmentVariableFilter = options.EnvironmentVariableFilter,
+            // Without this the redaction boundary is lost between the runner and the process
+            // factory, and a direct AppHost launch would log its forwarded arguments verbatim.
+            AppHostArgumentStartIndex = options.AppHostArgumentStartIndex,
             GracefulShutdownSignaler = options.GracefulShutdownSignaler,
             ShutdownService = options.ShutdownService,
             StandardOutputCallback = line =>
@@ -468,7 +516,7 @@ internal sealed class DotNetCliRunner(
         logger.LogDebug("Starting backchannel connection to AppHost at {SocketPath}", socketPath);
 
         var startTime = DateTimeOffset.UtcNow;
-        var connectionTimeout = GetBackchannelConnectionTimeout(configuration);
+        var connectionTimeout = AppHostStartupTimeout.GetBackchannelConnectionTimeout(configuration);
 
         do
         {
@@ -588,7 +636,7 @@ internal sealed class DotNetCliRunner(
         }
 
         // Users often invoke the dogfood CLI through a symlink such as
-        // ~/bin/aspire -> artifacts/bin/Aspire.Cli/Debug/net10.0/aspire. Resolve the
+        // ~/bin/aspire -> artifacts/bin/Aspire.Cli/Debug/net11.0/aspire. Resolve the
         // link before forwarding so a symlinked raw build cannot stamp stale
         // bundle metadata through ResolveAspireCliBundle's AspireCliPath path.
         var resolvedProcessPath = PathNormalizer.ResolveSymlinks(processPath);
@@ -638,24 +686,6 @@ internal sealed class DotNetCliRunner(
     {
         return BundleDiscovery.TryDiscoverDcpFromDirectory(bundleRoot, out _, out _, out _)
             && BundleDiscovery.TryDiscoverManagedFromDirectory(bundleRoot, out _);
-    }
-
-    internal static TimeSpan GetBackchannelConnectionTimeout(IConfiguration configuration)
-    {
-        var configuredValue = configuration[KnownConfigNames.CliBackchannelConnectTimeoutSeconds];
-        if (double.TryParse(configuredValue, CultureInfo.InvariantCulture, out var seconds) && seconds >= 0)
-        {
-            return TimeSpan.FromSeconds(seconds);
-        }
-
-        var timeout = TimeSpan.FromSeconds(WaitCommand.DefaultTimeoutSeconds);
-        var configuredStartupTimeout = configuration[CliConfigNames.AppHostStartupTimeout];
-        if (int.TryParse(configuredStartupTimeout, CultureInfo.InvariantCulture, out var startupTimeoutSeconds) && startupTimeoutSeconds > timeout.TotalSeconds)
-        {
-            timeout = TimeSpan.FromSeconds(startupTimeoutSeconds);
-        }
-
-        return timeout;
     }
 
     // Cache expiry/max age handled inside DiskCache implementation.
@@ -890,22 +920,28 @@ internal sealed class DotNetCliRunner(
         var noBuildSwitch = noBuild ? "--no-build" : string.Empty;
         var noRestoreSwitch = noRestore && !noBuild ? "--no-restore" : string.Empty; // --no-build implies --no-restore
         var noProfileSwitch = options.NoLaunchProfile ? "--no-launch-profile" : string.Empty;
+        var launchProfile = options.NoLaunchProfile ? null : options.LaunchProfile;
+        string[] launchProfileSwitch = !string.IsNullOrEmpty(launchProfile)
+            ? [$"--launch-profile={launchProfile}"]
+            : [];
         var suppressCliRunHookProperty = $"/p:{KnownConfigNames.SuppressCliRunHook}=true";
         // Add --non-interactive flag when using watch to prevent interactive prompts during automation
         var nonInteractiveSwitch = watch ? "--non-interactive" : string.Empty;
         // Add --verbose flag when using watch and debug is enabled
         var verboseSwitch = watch && options.Debug ? "--verbose" : string.Empty;
 
-        string[] cliArgs = isSingleFile switch
+        string[] cliOptions = isSingleFile switch
         {
-            false => [watchOrRunCommand, nonInteractiveSwitch, verboseSwitch, noBuildSwitch, noRestoreSwitch, noProfileSwitch, "--project", projectFile.FullName, "--", .. args],
-            // File-based dotnet run only recomputes RunCommand during build. Omit --no-build
-            // for single-file AppHosts so the suppression property is applied before launch
-            // and a CLI-launched AppHost cannot recursively enter the run hook.
-            true => ["run", noRestoreSwitch, noProfileSwitch, suppressCliRunHookProperty, "--file", projectFile.FullName, "--", .. args]
+            false => [watchOrRunCommand, nonInteractiveSwitch, verboseSwitch, noBuildSwitch, noRestoreSwitch, noProfileSwitch, .. launchProfileSwitch, "--project", projectFile.FullName],
+            // BuildAsync applies the suppression property when it compiles file-based AppHosts, so
+            // --no-build can reuse that output without recursively entering the CLI run hook.
+            true => ["run", noBuildSwitch, noRestoreSwitch, noProfileSwitch, .. launchProfileSwitch, noBuild ? string.Empty : suppressCliRunHookProperty, "--file", projectFile.FullName]
         };
 
-        cliArgs = [.. cliArgs.Where(arg => !string.IsNullOrWhiteSpace(arg))];
+        // Empty extension-owned entries represent omitted optional switches, while empty or
+        // whitespace-only entries after "--" are valid AppHost arguments. Filter only the
+        // option prefix so application argument boundaries survive CLI-to-extension delegation.
+        string[] cliArgs = [.. cliOptions.Where(arg => !string.IsNullOrWhiteSpace(arg)), "--", .. args];
 
         var finalEnv = CreateRunEnvironment(
             env,
@@ -1241,7 +1277,10 @@ internal sealed class DotNetCliRunner(
             cancellationToken: cancellationToken);
     }
 
-    public async Task<int> BuildAsync(FileInfo projectFilePath, bool noRestore, ProcessInvocationOptions options, CancellationToken cancellationToken)
+    public Task<int> BuildAsync(FileInfo projectFilePath, bool noRestore, ProcessInvocationOptions options, CancellationToken cancellationToken)
+        => BuildAsync(projectFilePath, noRestore, env: null, options, cancellationToken);
+
+    public async Task<int> BuildAsync(FileInfo projectFilePath, bool noRestore, IDictionary<string, string>? env, ProcessInvocationOptions options, CancellationToken cancellationToken)
     {
         using var activity = telemetry.StartDiagnosticActivity();
 
@@ -1249,9 +1288,14 @@ internal sealed class DotNetCliRunner(
         string[] cliArgs = ["build", noRestoreSwitch, projectFilePath.FullName];
         cliArgs = [.. cliArgs.Where(arg => !string.IsNullOrWhiteSpace(arg))];
 
+        // File-based AppHosts derive their RunCommand during build. Persist suppression into that
+        // generated command so the later dotnet run --no-build cannot recursively invoke Aspire CLI.
+        var buildEnvironment = env?.ToDictionary() ?? new Dictionary<string, string>();
+        buildEnvironment[KnownConfigNames.SuppressCliRunHook] = "true";
+
         return await ExecuteAsync(
             args: cliArgs,
-            env: null,
+            env: buildEnvironment,
             projectFile: projectFilePath,
             workingDirectory: projectFilePath.Directory!,
             backchannelCompletionSource: null,

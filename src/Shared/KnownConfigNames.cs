@@ -10,6 +10,7 @@ internal static class KnownConfigNames
     public const string DashboardOtlpGrpcEndpointUrl = "ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL";
     public const string DashboardOtlpHttpEndpointUrl = "ASPIRE_DASHBOARD_OTLP_HTTP_ENDPOINT_URL";
     public const string DashboardFrontendBrowserToken = "ASPIRE_DASHBOARD_FRONTEND_BROWSERTOKEN";
+    public const string DashboardSuppressBrowserTokenInOutput = "ASPIRE_DASHBOARD_SUPPRESS_BROWSER_TOKEN_IN_OUTPUT";
     public const string DashboardResourceServiceClientApiKey = "ASPIRE_DASHBOARD_RESOURCESERVICE_APIKEY";
     public const string DashboardUnsecuredAllowAnonymous = "ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS";
     public const string DashboardCorsAllowedOrigins = "ASPIRE_DASHBOARD_CORS_ALLOWED_ORIGINS";
@@ -23,6 +24,7 @@ internal static class KnownConfigNames
     public const string ResourceServiceEndpointUrl = "ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL";
 
     public const string ContainerRuntime = "ASPIRE_CONTAINER_RUNTIME";
+    public const string ContainerTunnelBaseImage = "ASPIRE_CONTAINER_TUNNEL_BASE_IMAGE";
     public const string DependencyCheckTimeout = "ASPIRE_DEPENDENCY_CHECK_TIMEOUT";
     public const string ProxylessEndpointPortRange = "ASPIRE_PROXYLESS_ENDPOINT_PORT_RANGE";
     public const string ServiceStartupWatchTimeout = "ASPIRE_SERVICE_STARTUP_WATCH_TIMEOUT";
@@ -40,6 +42,13 @@ internal static class KnownConfigNames
     public const string CliProcessId = "ASPIRE_CLI_PID";
     public const string CliProcessStarted = "ASPIRE_CLI_STARTED";
     public const string CliProcessStartedStable = "ASPIRE_CLI_STARTED_STABLE";
+
+    // Direct AppHost owner of an aspire-managed terminalhost process. The terminal host watches
+    // this identity so it can shut down and unlink its sockets if the AppHost disappears.
+    public const string TerminalHostParentProcessId = "ASPIRE_TERMINAL_HOST_PARENT_PID";
+    public const string TerminalHostParentProcessStartedStable = "ASPIRE_TERMINAL_HOST_PARENT_STARTED_STABLE";
+    public const string TerminalHostTelemetryEnabled = "ASPIRE_TERMINAL_HOST_TELEMETRY_ENABLED";
+    public const string TerminalWatchBufferCapacity = "ASPIRE_TERMINAL_WATCH_BUFFER_CAPACITY";
 
     // Identity (PID + start time) of the foreground CLI that spawned a detached `aspire start` /
     // `aspire run --detach` child. The detached child watches this during startup and tears the
@@ -61,6 +70,7 @@ internal static class KnownConfigNames
     public const string TestingDisableHttpClient = "ASPIRE_TESTING_DISABLE_HTTP_CLIENT";
     public const string InteractivityEnabled = "ASPIRE_INTERACTIVITY_ENABLED";
     public const string EnableContainerTunnel = "ASPIRE_ENABLE_CONTAINER_TUNNEL";
+    public const string AspireHome = "ASPIRE_HOME";
     public const string AspireUserSecretsId = "ASPIRE_USER_SECRETS_ID";
     public const string MaxFileUploadSize = "ASPIRE_MAX_FILE_UPLOAD_SIZE";
 
@@ -89,6 +99,9 @@ internal static class KnownConfigNames
     public const string CliDotnetBinlogDirectory = "ASPIRE_CLI_DOTNET_BINLOG_DIR";
     public const string CliBackchannelConnectTimeoutSeconds = "ASPIRE_CLI_BACKCHANNEL_CONNECT_TIMEOUT_SECONDS";
 
+    // Internal extension-to-CLI handoff used to preserve AppHost selection ownership.
+    public const string CliAppHostSelectionOrigin = "ASPIRE_CLI_APPHOST_SELECTION_ORIGIN";
+
     // DCP owns these profiling variables. Aspire maps its profiling state to these names when
     // spawning DCP because DCP intentionally does not read ASPIRE_* configuration names.
     public const string DcpOtelStartupProfilingEnabled = "DCP_OTEL_STARTUP_PROFILING_ENABLED";
@@ -114,6 +127,7 @@ internal static class KnownConfigNames
     public const string DebugSessionToken = "DEBUG_SESSION_TOKEN";
     public const string DebugSessionServerCertificate = "DEBUG_SESSION_SERVER_CERTIFICATE";
     public const string DcpInstanceIdPrefix = "DCP_INSTANCE_ID_PREFIX";
+    public const string DcpWorkloadId = "DCP_WORKLOAD_ID";
 
     public static class Legacy
     {
